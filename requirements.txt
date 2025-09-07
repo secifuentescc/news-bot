@@ -4,3 +4,5 @@ feedparser
 beautifulsoup4
 python-dotenv
 google-generativeai
+argostranslate==1.9.6
+sentencepiece==0.2.0
