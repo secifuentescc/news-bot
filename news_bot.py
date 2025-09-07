@@ -1,11 +1,11 @@
 import os
-import time
 import logging
 import requests
 import feedparser
 from datetime import datetime
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
+import google.generativeai as genai
 
 # ============== CONFIG ==============
 load_dotenv()
@@ -38,6 +38,12 @@ NEWS_SOURCES = {
 class NewsBot:
     def __init__(self):
         self.processed = set()
+        try:
+            genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
+            self.model = genai.GenerativeModel("gemini-pro")
+        except Exception as e:
+            logger.warning(f"No se pudo inicializar Gemini: {e}")
+            self.model = None
 
     def send_message(self, text: str):
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -52,6 +58,17 @@ class NewsBot:
                 logger.error(r.text)
         except Exception as e:
             logger.error(f"Error enviando a Telegram: {e}")
+
+    def translate(self, text: str) -> str:
+        if not text or not self.model:
+            return text
+        try:
+            prompt = f"Traduce al español de forma natural:\n\n{text}"
+            response = self.model.generate_content(prompt)
+            return response.text.strip()
+        except Exception as e:
+            logger.error(f"Error traduciendo: {e}")
+            return text
 
     def get_rss(self, category: str):
         arts = []
@@ -78,7 +95,9 @@ class NewsBot:
             return "No hay noticias nuevas."
         text = f"📰 *Resumen de noticias* - {datetime.now().strftime('%d/%m/%Y %H:%M')}\n\n"
         for a in articles:
-            text += f"• *{a['title']}*\n{a['desc'][:120]}...\n[Leer más]({a['link']})\n\n"
+            title = self.translate(a["title"])
+            desc = self.translate(a["desc"])
+            text += f"• *{title}*\n{desc[:120]}...\n[Leer más]({a['link']})\n\n"
         return text
 
     def run(self):
