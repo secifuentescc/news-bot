@@ -21,9 +21,8 @@ logger = logging.getLogger(__name__)
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 GEMINI_KEY = (os.getenv("GEMINI_API_KEY") or "").strip()
-NEWSAPI_KEY = (os.getenv("NEWSAPI_KEY") or "").strip()  # opcional
 
-# Fuentes RSS (fuerte en tecnología y ampliado Colombia)
+# Fuentes RSS
 NEWS_SOURCES = {
     "mundial": [
         "https://feeds.bbci.co.uk/news/world/rss.xml",
@@ -57,18 +56,14 @@ NEWS_SOURCES = {
 }
 
 def quotas_for_today():
-    # Fin de semana => un poco menos de tech
     is_weekend = datetime.utcnow().weekday() >= 5
     return {"tecnologia": (7 if not is_weekend else 5), "colombia": 2, "mundial": 2}
 
 STATE_PATH = pathlib.Path("state_sent.json")
 
-# ================== ESCAPE MARKDOWN (CLÁSICO) ==================
+# ================== ESCAPE MARKDOWN ==================
 def escape_markdown(text: str) -> str:
-    """
-    Escape mínimo para Markdown clásico de Telegram.
-    NO toca los asteriscos (*) para que *negrita* funcione.
-    """
+    """Escape mínimo para Markdown clásico de Telegram (mantiene *negrita*)."""
     if not text:
         return ""
     return (
@@ -110,46 +105,6 @@ def save_state(sent_ids: set):
     except Exception as e:
         logger.warning(f"No se pudo guardar el estado: {e}")
 
-# ======= Heurística de idioma + refuerzo de español (Gemini) =======
-def is_probably_english(text: str) -> bool:
-    if not text:
-        return False
-    t = text.lower()
-    common = [" the ", " and ", " for ", " with ", " from ", " in ", " on ", " at ",
-              " to ", " of ", " by ", " is ", " are ", " was ", " were ", " as ",
-              " it ", " this ", " that "]
-    t_spaced = f" {t} "
-    hits = sum(1 for w in common if w in t_spaced)
-    return hits >= 2
-
-def ensure_spanish(text: str, model) -> str:
-    """
-    Intenta 2 veces con Gemini: si detectamos inglés, reescribe forzando español.
-    """
-    if not text or not model:
-        return text
-    prompt = (
-        "Traduce al ESPAÑOL neutro, claro y natural. "
-        "No agregues comentarios, notas ni comillas. SOLO el texto final en español.\n\n"
-        f"{text}"
-    )
-    try:
-        r = model.generate_content(prompt)
-        out = (getattr(r, "text", "") or "").strip()
-        if out and not is_probably_english(out):
-            return out
-        # Reintento más estricto
-        prompt2 = (
-            "Reescribe ÍNTEGRAMENTE en ESPAÑOL neutro y natural. "
-            "Prohibido dejar texto en inglés. No agregues comentarios.\n\n"
-            f"{text}"
-        )
-        r2 = model.generate_content(prompt2)
-        out2 = (getattr(r2, "text", "") or "").strip()
-        return out2 or text
-    except Exception:
-        return text
-
 # ================== BOT ==================
 class NewsBot:
     def __init__(self, only_tech: bool = False):
@@ -157,20 +112,12 @@ class NewsBot:
         self.processed = set()
         self.sent_ids = load_state()
 
-        # Inicializa Gemini (modelo PRO + config estable)
+        # Inicializa Gemini (modelo PRO)
         self.model = None
         if GEMINI_KEY:
             try:
                 genai.configure(api_key=GEMINI_KEY)
-                gen_cfg = {
-                    "temperature": 0.2,
-                    "top_p": 0.9,
-                    "top_k": 40,
-                }
-                self.model = genai.GenerativeModel(
-                    model_name="gemini-1.5-pro",
-                    generation_config=gen_cfg
-                )
+                self.model = genai.GenerativeModel("gemini-1.5-pro")
                 masked = GEMINI_KEY[:4] + "..." + GEMINI_KEY[-4:]
                 logger.info(f"Gemini listo (key {masked}).")
             except Exception as e:
@@ -180,7 +127,7 @@ class NewsBot:
 
     # ------------ Transporte ------------
     def send_message(self, text: str):
-        """Envía un mensaje genérico (Markdown clásico)."""
+        """Envía mensaje a Telegram con Markdown clásico."""
         if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
             logger.error("Faltan TELEGRAM_BOT_TOKEN o TELEGRAM_CHAT_ID.")
             return
@@ -188,8 +135,8 @@ class NewsBot:
         payload = {
             "chat_id": TELEGRAM_CHAT_ID,
             "text": text,
-            "parse_mode": "Markdown",          # Markdown clásico
-            "disable_web_page_preview": False, # Permite previews
+            "parse_mode": "Markdown",
+            "disable_web_page_preview": False,
         }
         try:
             r = requests.post(url, data=payload, timeout=25)
@@ -199,18 +146,14 @@ class NewsBot:
             logger.error(f"Error enviando a Telegram: {e}")
 
     def send_article(self, title: str, resumen: str, url: str, section_title: str = None, icon: str = ""):
-        """
-        Envía UNA noticia por mensaje, con URL en texto plano para forzar preview con imagen.
-        """
+        """Envía una noticia con preview (URL en texto plano)."""
         lines = []
         if section_title:
             lines.append(f"{icon} *{escape_markdown(section_title)}*")
         lines.append(f"• *{escape_markdown(title)}*")
         if resumen:
             lines.append(escape_markdown(resumen))
-        # URL en texto plano → Telegram genera la tarjeta con imagen
         lines.append(url)
-
         text = "\n".join(lines)
         self.send_message(text)
 
@@ -220,17 +163,28 @@ class NewsBot:
 
     # ------------ IA helpers ------------
     def translate_force_es(self, text: str) -> str:
-        """Traduce al español con verificación y reintento."""
+        """Siempre reescribe el texto en español con Gemini."""
         if not text:
             return text
         if not self.model:
             logger.warning("Gemini no inicializado: envío sin traducir.")
             return text
-        out = ensure_spanish(text, self.model)
-        return out or text
+        prompt = (
+            "Reescribe este texto ÍNTEGRAMENTE en ESPAÑOL neutro, claro y natural. "
+            "Si ya está en español, simplemente reescríbelo mejorado. "
+            "No dejes nada en inglés. No agregues comillas ni comentarios.\n\n"
+            f"{text}"
+        )
+        try:
+            resp = self.model.generate_content(prompt)
+            out = (getattr(resp, "text", "") or "").strip()
+            return out or text
+        except Exception as e:
+            logger.error(f"Error traduciendo: {e}")
+            return text
 
     def summarize_extended(self, title_es: str, description_es: str, category: str) -> str:
-        """Resumen 3–5 frases en español. Si sale en inglés, se reintenta forzando español."""
+        """Resumen 3–5 frases siempre en español."""
         base = (description_es or title_es or "").strip()
         if not self.model:
             return base[:600]
@@ -238,35 +192,32 @@ class NewsBot:
             prompt = (
                 "Redacta un resumen informativo en ESPAÑOL (3 a 5 frases, "
                 "máximo ~100 palabras) sobre la noticia. Explica qué pasó, "
-                "por qué importa y da contexto. No incluyas opiniones.\n\n"
-                f"Título (ES): {title_es}\n"
-                f"Descripción/Extracto (ES): {description_es}\n"
+                "por qué importa y da contexto. NO dejes nada en inglés. "
+                "No agregues comentarios ni comillas.\n\n"
+                f"Título: {title_es}\n"
+                f"Descripción: {description_es}\n"
                 f"Categoría: {category.upper()}\n"
             )
             resp = self.model.generate_content(prompt)
             out = (getattr(resp, "text", "") or "").strip()
-            if not out:
-                return base[:600]
-            if is_probably_english(out):
-                out = ensure_spanish(out, self.model)
             return out or base[:600]
         except Exception as e:
             logger.error(f"Error resumiendo: {e}")
             return base[:600]
 
     def rank_with_gemini(self, articles):
-        """Puntúa importancia (0-10) priorizando tecnología; fallback heurístico."""
+        """Ranking básico: prioridad a tecnología si falla IA."""
         if not self.model or not articles:
-            # Heurística: tecnología primero
             return sorted(articles, key=lambda a: (a["cat"] != "tecnologia",))
         try:
             packed = "\n".join(
-                [f"{i+1}. [{a['cat']}] {a['title']}\n{(a['desc'] or '')[:280]}" for i, a in enumerate(articles)]
+                [f"{i+1}. [{a['cat']}] {a['title']}" for i, a in enumerate(articles)]
             )
             prompt = (
-                "Eres editor senior. Puntúa cada ítem del 1 al 10 según impacto, novedad "
-                "y relevancia para lectores hispanohablantes (da preferencia a TECNOLOGÍA "
-                "si el impacto es similar). Devuelve JSON: [{\"idx\": <n>, \"score\": <0-10>}].\n\n"
+                "Eres editor. Puntúa cada noticia del 1 al 10 según impacto, "
+                "novedad y relevancia para lectores hispanohablantes. "
+                "Da preferencia a TECNOLOGÍA si el impacto es similar. "
+                "Devuelve JSON: [{\"idx\": <n>, \"score\": <0-10>}].\n\n"
                 f"NOTICIAS:\n{packed}"
             )
             resp = self.model.generate_content(prompt)
@@ -316,58 +267,45 @@ class NewsBot:
         cats = ["tecnologia"] if self.only_tech else ["tecnologia", "colombia", "mundial"]
         for cat in cats:
             all_articles.extend(self.get_rss(cat))
-        logger.info(f"Recolectadas {len(all_articles)} noticias (only_tech={self.only_tech}).")
+        logger.info(f"Recolectadas {len(all_articles)} noticias.")
         return all_articles
 
     def select_top_by_quota(self, articles):
-        """
-        Ordena por importancia y GARANTIZA cupos por categoría (si hay artículos).
-        """
+        """Aplica cupos fijos por categoría (si hay artículos)."""
         if self.only_tech:
             tech = [a for a in articles if a["cat"] == "tecnologia"]
-            ranked = self.rank_with_gemini(tech)
-            return ranked[:7]
+            return self.rank_with_gemini(tech)[:7]
 
         if not articles:
             return []
         q = quotas_for_today()
         ranked = self.rank_with_gemini(articles)
 
-        # Agrupa por categoría preservando el orden del ranking
         by_cat = {"tecnologia": [], "colombia": [], "mundial": []}
         for a in ranked:
             if a["cat"] in by_cat:
                 by_cat[a["cat"]].append(a)
 
-        # Toma hasta el cupo disponible por categoría (si hay)
         selected = []
         for cat in ["tecnologia", "colombia", "mundial"]:
             selected.extend(by_cat[cat][: q.get(cat, 0)])
 
-        # Orden final para presentación
         order = {"tecnologia": 0, "colombia": 1, "mundial": 2}
         selected.sort(key=lambda a: order.get(a["cat"], 9))
-        logger.info({
-            "disponibles": {k: len(v) for k, v in by_cat.items()},
-            "tomadas": {k: len([x for x in selected if x['cat']==k]) for k in by_cat}
-        })
         return selected
 
     def run(self):
-        start = datetime.now()
         icons = {"tecnologia": "💻", "colombia": "🇨🇴", "mundial": "🌍"}
         titles = {"tecnologia": "TECNOLOGÍA", "colombia": "COLOMBIA", "mundial": "MUNDIAL"}
 
         all_articles = self.collect_all()
-        # Filtra artículos ya enviados
         all_articles = [a for a in all_articles if article_uid(a) not in self.sent_ids]
         selected = self.select_top_by_quota(all_articles)
 
-        # Cabecera general (un solo mensaje)
+        # Cabecera
         header = f"📰 *{escape_markdown('Boletín de noticias')}* — {escape_markdown(datetime.now().strftime('%d/%m/%Y %H:%M'))}"
         self.send_message(header)
 
-        # Envía cada noticia por separado para que Telegram muestre la preview con imagen
         current_cat = None
         for a in selected:
             section_title = None
@@ -383,29 +321,21 @@ class NewsBot:
 
             self.send_article(title_es, resumen, a["link"], section_title=section_title, icon=icon)
 
-        # Persistir IDs enviados
-        for a in selected:
             self.sent_ids.add(article_uid(a))
         save_state(self.sent_ids)
-
-        elapsed = (datetime.now() - start).seconds
-        logger.info(f"Boletín enviado. {len(selected)} noticias. Tiempo total: {elapsed}s.")
 
 # ================== MAIN ==================
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--only-tech", action="store_true", help="Enviar solo tecnología (ignora Colombia y Mundial)")
+    p.add_argument("--only-tech", action="store_true", help="Solo noticias de tecnología")
     return p.parse_args()
 
 def main():
     args = parse_args()
     bot = NewsBot(only_tech=args.only_tech)
-    # Prueba visible en logs (debe salir traducido si la key está bien)
     prueba = bot.translate_force_es("Breaking: Apple unveils a new AI feature for iPhone.")
     logger.info(f"Traducción de prueba: {prueba}")
-    logger.info("Generando y enviando boletín...")
     bot.run()
-    logger.info("Listo.")
 
 if __name__ == "__main__":
     main()
