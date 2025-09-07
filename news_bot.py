@@ -201,11 +201,70 @@ def fetch_article_snippet(url: str, min_len: int = 300, max_len: int = 900) -> s
                 candidates.append(txt[:max_len])
         if not candidates:
             return None
-        # el más largo dentro del rango
         best = sorted(candidates, key=len, reverse=True)[0]
         return best
     except Exception:
         return None
+
+# ================== TRADUCCIÓN ROBUSTA (helpers globales) ==================
+def _chunk_text_for_mymemory(text: str, max_len: int = 480):
+    """
+    Divide el texto en trozos <= max_len cuidando no cortar palabras.
+    Preferimos cortar en punto, luego espacio.
+    """
+    if not text:
+        return []
+    text = text.strip()
+    if len(text) <= max_len:
+        return [text]
+
+    chunks, buf = [], []
+    count = 0
+    sentences = re.split(r'(?<=[\.\!\?])\s+', text)
+    for s in sentences:
+        s = s.strip()
+        if not s:
+            continue
+        if count + len(s) + 1 <= max_len:
+            buf.append(s)
+            count += len(s) + 1
+        else:
+            if buf:
+                chunks.append(" ".join(buf).strip())
+            if len(s) > max_len:
+                words = s.split()
+                cur = []
+                cur_len = 0
+                for w in words:
+                    if cur_len + len(w) + 1 <= max_len:
+                        cur.append(w)
+                        cur_len += len(w) + 1
+                    else:
+                        chunks.append(" ".join(cur).strip())
+                        cur = [w]
+                        cur_len = len(w)
+                if cur:
+                    chunks.append(" ".join(cur).strip())
+                buf, count = [], 0
+            else:
+                buf = [s]
+                count = len(s)
+    if buf:
+        chunks.append(" ".join(buf).strip())
+    return chunks
+
+def _looks_spanish(text: str) -> bool:
+    """
+    Heurística ligera para evitar traducir lo que ya está en español.
+    """
+    if not text:
+        return False
+    low = text.lower()
+    common = [" el ", " la ", " los ", " las ", " un ", " una ", " y ", " de ", " del ",
+              " que ", " para ", " con ", " por ", " en ", " se ", " no ", " sí ", " este ", " esta "]
+    hits = sum(1 for w in common if w in f" {low} ")
+    accents = any(c in low for c in "áéíóúñ")
+    return hits >= 3 or accents
 
 # ================== BOT ==================
 class NewsBot:
@@ -274,11 +333,20 @@ class NewsBot:
 
     # ------------ Traducción / Resumen ------------
     def translate_force_es(self, text: str) -> str:
-        """Fuerza traducción al español. Gemini → MyMemory → original."""
+        """
+        Fuerza traducción al español.
+        1) Si ya parece español, devuelve tal cual.
+        2) Intenta Gemini (si está disponible).
+        3) Fallback: MyMemory troceando en <=480 chars para evitar 'max allowed query: 500 chars'.
+        4) Si todo falla, devuelve el original.
+        """
         if not text:
             return text
 
-        # 1) Gemini si está disponible
+        if _looks_spanish(text):
+            return text
+
+        # 1) Gemini
         if self.model:
             try:
                 prompt = (
@@ -293,31 +361,37 @@ class NewsBot:
             except Exception as e:
                 logger.warning(f"Gemini traducción falló: {e}")
 
-        # 2) Fallback: MyMemory (en->es)
+        # 2) MyMemory (chunked)
         try:
-            r = requests.get(
-                "https://api.mymemory.translated.net/get",
-                params={"q": text, "langpair": "en|es"},
-                timeout=12,
-            )
-            if r.ok:
-                data = r.json()
-                out = data.get("responseData", {}).get("translatedText", "")
-                if out:
-                    logger.info("Traducción vía MyMemory OK.")
-                    return out
+            parts = _chunk_text_for_mymemory(text, max_len=480)
+            translated_parts = []
+            for p in parts:
+                r = requests.get(
+                    "https://api.mymemory.translated.net/get",
+                    params={"q": p, "langpair": "en|es"},
+                    timeout=12,
+                )
+                if r.ok:
+                    data = r.json()
+                    frag = data.get("responseData", {}).get("translatedText", "") or p
+                else:
+                    frag = p
+                translated_parts.append(frag)
+            out = " ".join(translated_parts).strip()
+            if out:
+                logger.info("Traducción vía MyMemory OK (chunked).")
+                return out
         except Exception as e:
-            logger.warning(f"MyMemory falló: {e}")
+            logger.warning(f"MyMemory (chunked) falló: {e}")
 
-        # 3) Último recurso: original
+        # 3) Original
         return text
 
     def summarize_extended(self, title_es: str, base_es: str, category: str) -> str:
         """
         Resumen extendido (~120–160 palabras). Con IA si hay cuota, si no:
-        - usamos base_es o extraído de la página para enriquecer.
+        usamos base_es (ya traducido y/o enriquecido).
         """
-        # Intento IA
         if self.model:
             try:
                 prompt = (
@@ -338,7 +412,6 @@ class NewsBot:
             except Exception as e:
                 logger.warning(f"Gemini resumen extendido falló: {e}")
 
-        # Sin IA o falló: usamos el texto enriquecido
         return base_es[:900]
 
     def rank_with_gemini(self, articles):
@@ -346,7 +419,6 @@ class NewsBot:
         Ranking con IA si hay, y además reforzamos prioridades manuales:
         - Peso extra fuerte: Apple/iOS/Swift, JavaScript, Python, AI/ML, DevTools, GitHub.
         """
-        # Boost manual por keywords (insensible a mayúsculas)
         KW_BOOST = {
             # Apple / iOS
             "apple": 2.2, "ios": 2.2, "iphone": 1.8, "ipad": 1.6, "mac": 1.4, "swift": 2.0, "xcode": 1.9, "wwdc": 2.2,
@@ -363,7 +435,6 @@ class NewsBot:
             for k, w in KW_BOOST.items():
                 if k in text:
                     base += w
-            # tecnología parte arriba por defecto
             if a["cat"] == "tecnologia":
                 base += 0.8
             return base
@@ -371,7 +442,6 @@ class NewsBot:
         if not self.model or not articles:
             return sorted(articles, key=manual_score, reverse=True)
 
-        # Con IA: mezclamos score IA + boost manual
         try:
             packed = "\n".join(
                 [f"{i+1}. [{a['cat']}] {a['title']}\n{(a['desc'] or '')[:280]}" for i, a in enumerate(articles)]
@@ -528,7 +598,7 @@ class NewsBot:
                     if extra:
                         base_text = (base_text + "\n\n" + extra).strip()
 
-                # 3) Traducimos la base al español
+                # 3) Traducimos la base al español (robusto/chunked)
                 base_es = self.translate_force_es(base_text)
 
                 # 4) Resumen extendido (IA si hay cuota; si no, el base_es ya es largo)
