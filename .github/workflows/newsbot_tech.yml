@@ -1,0 +1,46 @@
+name: NewsBot Tech Only
+
+on:
+  schedule:
+    # GitHub Actions usa UTC. Bogotá = UTC-5.
+    # 12:00 en Bogotá → 17:00 UTC
+    - cron: "0 17 * * *"
+  workflow_dispatch: {}  # permite correrlo manualmente
+
+jobs:
+  run-newsbot-tech:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Cache sent state
+        uses: actions/cache@v4
+        with:
+          path: state_sent.json
+          key: sent-state
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run bot (only tech)
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          NEWSAPI_KEY: ${{ secrets/NEWSAPI_KEY }}
+        run: |
+          python news_bot.py --only-tech
+
+      - name: Upload report artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: boletin-tech
+          path: reports/
