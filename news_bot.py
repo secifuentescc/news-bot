@@ -22,7 +22,18 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 GEMINI_KEY = (os.getenv("GEMINI_API_KEY") or "").strip()
 
-REQUESTS_TIMEOUT = 25  # segundos
+REQUESTS_TIMEOUT = 10  # segundos por intento de traducción
+STATE_PATH = pathlib.Path("state_sent.json")
+
+# Fallbacks públicos (puedes cambiar el orden)
+LIBRE_ENDPOINTS = [
+    os.getenv("LIBRETRANSLATE_URL", "").strip() or None,  # si defines tu propia URL
+    "https://translate.argosopentech.com/translate",
+    "https://libretranslate.com/translate",
+    "https://translate.astian.org/translate",
+]
+# Si todos fallan, usamos MyMemory (gratis)
+MYMEMORY_URL = "https://api.mymemory.translated.net/get"
 
 # Fuentes RSS
 NEWS_SOURCES = {
@@ -61,11 +72,8 @@ def quotas_for_today():
     is_weekend = datetime.utcnow().weekday() >= 5
     return {"tecnologia": (7 if not is_weekend else 5), "colombia": 2, "mundial": 2}
 
-STATE_PATH = pathlib.Path("state_sent.json")
-
 # ================== ESCAPE MARKDOWN ==================
 def escape_markdown(text: str) -> str:
-    """Escape mínimo para Markdown clásico de Telegram (mantiene *negrita*)."""
     if not text:
         return ""
     return (
@@ -75,7 +83,7 @@ def escape_markdown(text: str) -> str:
             .replace("`", "\\`")
     )
 
-# ================== UTILIDADES ==================
+# ================== UTIL ==================
 def chunk(text: str, limit: int = 4096):
     parts = []
     t = text
@@ -107,25 +115,48 @@ def save_state(sent_ids: set):
     except Exception as e:
         logger.warning(f"No se pudo guardar el estado: {e}")
 
-# ================== FALLBACK DE TRADUCCIÓN (LibreTranslate) ==================
-def libretranslate(text: str, target="es") -> str:
-    """
-    Fallback gratuito. Puedes cambiar la URL por otra instancia si esta se satura.
-    """
+# ================== TRADUCTORES ==================
+def translate_via_libre(text: str) -> str:
     if not text:
         return text
-    url = os.getenv("LIBRETRANSLATE_URL", "https://libretranslate.com/translate")
-    data = {"q": text, "source": "auto", "target": target, "format": "text"}
+    for url in LIBRE_ENDPOINTS:
+        if not url:
+            continue
+        try:
+            r = requests.post(
+                url,
+                data={"q": text, "source": "auto", "target": "es", "format": "text"},
+                timeout=REQUESTS_TIMEOUT,
+            )
+            if r.ok:
+                out = (r.json().get("translatedText") or "").strip()
+                if out:
+                    logger.info(f"Traducción vía LibreTranslate OK: {url}")
+                    return out
+            else:
+                logger.debug(f"LibreTranslate {url} status {r.status_code}: {r.text[:120]}")
+        except Exception as e:
+            logger.debug(f"LibreTranslate fallo {url}: {e}")
+    return ""
+
+def translate_via_mymemory(text: str) -> str:
+    if not text:
+        return text
     try:
-        r = requests.post(url, data=data, timeout=10)
+        r = requests.get(
+            MYMEMORY_URL,
+            params={"q": text, "langpair": "auto|es"},
+            timeout=REQUESTS_TIMEOUT,
+        )
         if r.ok:
-            out = r.json().get("translatedText", "") or ""
-            if out.strip():
-                logger.info("Traducción vía LibreTranslate usada.")
-                return out.strip()
+            data = r.json()
+            out = (data.get("responseData", {}).get("translatedText") or "").strip()
+            if out:
+                logger.info("Traducción vía MyMemory OK.")
+                return out
     except Exception as e:
-        logger.warning(f"Fallback LibreTranslate falló: {e}")
-    return text
+        logger.debug(f"MyMemory fallo: {e}")
+    return ""
 
 # ================== BOT ==================
 class NewsBot:
@@ -134,12 +165,11 @@ class NewsBot:
         self.processed = set()
         self.sent_ids = load_state()
 
-        # Inicializa Gemini con extracción robusta
         self.model = None
+        self.gemini_disabled = False
         if GEMINI_KEY:
             try:
                 genai.configure(api_key=GEMINI_KEY)
-                # Intenta pro-latest; si falla, cae a pro
                 try:
                     self.model = genai.GenerativeModel("gemini-1.5-pro-latest")
                 except Exception:
@@ -148,15 +178,20 @@ class NewsBot:
                 logger.info(f"Gemini listo (key {masked}).")
             except Exception as e:
                 logger.warning(f"No se pudo inicializar Gemini: {e}")
+                self.gemini_disabled = True
         else:
-            logger.warning("GEMINI_API_KEY no definido: no habrá traducción ni resúmenes IA.")
+            logger.warning("GEMINI_API_KEY no definido.")
+            self.gemini_disabled = True
 
-    # ------------ Gemini helper ------------
+    # ---- Gemini helpers ----
+    def _handle_gemini_error(self, e: Exception):
+        msg = str(e)
+        if "429" in msg or "quota" in msg.lower():
+            logger.warning("Cuota Gemini excedida; desactivo Gemini para este run.")
+            self.gemini_disabled = True
+
     @staticmethod
     def _extract_text(resp) -> str:
-        """
-        Extrae texto de la respuesta de google-generativeai de forma robusta.
-        """
         try:
             if hasattr(resp, "text") and resp.text:
                 return resp.text
@@ -166,7 +201,6 @@ class NewsBot:
                     parts = cand.content.parts
                     texts = []
                     for p in parts:
-                        # parts pueden tener .text o dict-like
                         t = getattr(p, "text", None)
                         if t:
                             texts.append(t)
@@ -174,24 +208,23 @@ class NewsBot:
                             texts.append(p["text"])
                     if texts:
                         return "".join(texts)
-        except Exception as e:
-            logger.debug(f"No se pudo extraer texto de Gemini: {e}")
+        except Exception:
+            pass
         return ""
 
     def gemini_generate(self, prompt: str) -> str:
-        if not self.model:
+        if self.gemini_disabled or not self.model:
             return ""
         try:
             resp = self.model.generate_content(prompt)
-            out = self._extract_text(resp).strip()
-            return out
+            return (self._extract_text(resp) or "").strip()
         except Exception as e:
             logger.warning(f"Gemini generate_content falló: {e}")
+            self._handle_gemini_error(e)
             return ""
 
-    # ------------ Transporte ------------
+    # ---- Transporte ----
     def send_message(self, text: str):
-        """Envía mensaje a Telegram con Markdown clásico."""
         if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
             logger.error("Faltan TELEGRAM_BOT_TOKEN o TELEGRAM_CHAT_ID.")
             return
@@ -203,62 +236,57 @@ class NewsBot:
             "disable_web_page_preview": False,
         }
         try:
-            r = requests.post(url, data=payload, timeout=REQUESTS_TIMEOUT)
+            r = requests.post(url, data=payload, timeout=20)
             if not r.ok:
                 logger.error(f"Telegram error: {r.text}")
         except Exception as e:
             logger.error(f"Error enviando a Telegram: {e}")
 
     def send_article(self, title: str, resumen: str, url: str, section_title: str = None, icon: str = ""):
-        """Envía una noticia con preview (URL en texto plano)."""
         lines = []
         if section_title:
             lines.append(f"{icon} *{escape_markdown(section_title)}*")
         lines.append(f"• *{escape_markdown(title)}*")
         if resumen:
             lines.append(escape_markdown(resumen))
-        lines.append(url)
-        text = "\n".join(lines)
-        self.send_message(text)
+        lines.append(url)  # texto plano para preview con imagen
+        self.send_message("\n".join(lines))
 
-    def send_long(self, text: str):
-        for p in chunk(text):
-            self.send_message(p)
-
-    # ------------ IA helpers (forzar español) ------------
+    # ---- IA/Traducción ----
     def translate_force_es(self, text: str) -> str:
-        """Siempre reescribe en español. Usa Gemini y cae a LibreTranslate si hay fallo/silencio."""
         if not text:
             return text
-        # 1) Gemini
-        if self.model:
+        # 1) Gemini (si disponible)
+        if not self.gemini_disabled and self.model:
             prompt = (
-                "Reescribe este texto ÍNTEGRAMENTE en ESPAÑOL neutro, claro y natural. "
-                "Si ya está en español, simplemente reescríbelo mejorado. "
+                "Reescribe ÍNTEGRAMENTE en ESPAÑOL neutro, claro y natural. "
+                "Si ya está en español, reescríbelo mejorado. "
                 "No dejes nada en inglés. No agregues comillas ni comentarios.\n\n"
                 f"{text}"
             )
             out = self.gemini_generate(prompt)
             if out:
                 return out
-            logger.info("Gemini no devolvió texto; intento fallback a LibreTranslate.")
-        else:
-            logger.warning("Gemini no inicializado: usando fallback de traducción.")
-        # 2) Fallback LibreTranslate
-        return libretranslate(text, target="es")
+            logger.info("Gemini sin salida; usaré fallback de traducción.")
+        # 2) LibreTranslate (varias instancias)
+        out = translate_via_libre(text)
+        if out:
+            return out
+        # 3) MyMemory
+        out = translate_via_mymemory(text)
+        if out:
+            return out
+        # 4) último recurso: devuelve original
+        return text
 
     def summarize_extended(self, title_es: str, description_es: str, category: str) -> str:
-        """Resumen 3–5 frases SIEMPRE en español. Usa Gemini y cae a LibreTranslate si es necesario."""
         base = (description_es or title_es or "").strip()
-        if not base:
-            base = title_es or ""
-        # 1) Gemini
-        if self.model:
+        # 1) Gemini resumen si disponible
+        if not self.gemini_disabled and self.model:
             prompt = (
                 "Redacta un resumen informativo en ESPAÑOL (3 a 5 frases, "
-                "máximo ~100 palabras) sobre la noticia. Explica qué pasó, "
-                "por qué importa y da contexto. NO dejes nada en inglés. "
-                "No agregues comentarios ni comillas.\n\n"
+                "máximo ~100 palabras). Explica qué pasó, por qué importa y da contexto. "
+                "NO dejes nada en inglés. No agregues comentarios ni comillas.\n\n"
                 f"Título: {title_es}\n"
                 f"Descripción: {description_es}\n"
                 f"Categoría: {category.upper()}\n"
@@ -266,39 +294,12 @@ class NewsBot:
             out = self.gemini_generate(prompt)
             if out:
                 return out
-            logger.info("Gemini no devolvió texto en resumen; usaré fallback.")
-        # 2) Fallback simple: si base parece inglés, intenta traducirlo
-        return libretranslate(base, target="es")[:600]
+            logger.info("Gemini sin salida en resumen; usaré fallback.")
+        # 2) Fallback: si parece inglés, traducir y cortar
+        tr = self.translate_force_es(base)
+        return tr[:600]
 
-    def rank_with_gemini(self, articles):
-        """Ranking básico: prioridad a tecnología si falla IA."""
-        if not self.model or not articles:
-            return sorted(articles, key=lambda a: (a["cat"] != "tecnologia",))
-        try:
-            packed = "\n".join([f"{i+1}. [{a['cat']}] {a['title']}" for i, a in enumerate(articles)])
-            prompt = (
-                "Eres editor. Puntúa cada noticia del 1 al 10 según impacto, "
-                "novedad y relevancia para lectores hispanohablantes. "
-                "Da preferencia a TECNOLOGÍA si el impacto es similar. "
-                "Devuelve JSON: [{\"idx\": <n>, \"score\": <0-10>}].\n\n"
-                f"NOTICIAS:\n{packed}"
-            )
-            out = self.gemini_generate(prompt)
-            if not out:
-                raise ValueError("Respuesta vacía del ranker.")
-            scores = json.loads(out)
-            score_map = {int(it["idx"]) - 1: float(it["score"]) for it in scores if "idx" in it and "score" in it}
-            ranked = sorted(
-                articles,
-                key=lambda a: score_map.get(a["_i"], 0.0) + (1.0 if a["cat"] == "tecnologia" else 0.0),
-                reverse=True,
-            )
-            return ranked
-        except Exception as e:
-            logger.warning(f"No se pudo rankear con IA: {e}")
-            return sorted(articles, key=lambda a: (a["cat"] != "tecnologia",))
-
-    # ------------ Datos ------------
+    # ---- Datos ----
     def get_rss(self, category: str):
         arts = []
         for rss in NEWS_SOURCES.get(category, []):
@@ -325,39 +326,33 @@ class NewsBot:
                 logger.error(f"Error con RSS {rss}: {e}")
         return arts
 
-    # ------------ Pipeline ------------
+    # ---- Selección ----
     def collect_all(self):
-        all_articles = []
         cats = ["tecnologia"] if self.only_tech else ["tecnologia", "colombia", "mundial"]
+        all_articles = []
         for cat in cats:
             all_articles.extend(self.get_rss(cat))
         logger.info(f"Recolectadas {len(all_articles)} noticias.")
         return all_articles
 
     def select_top_by_quota(self, articles):
-        """Aplica cupos fijos por categoría (si hay artículos)."""
         if self.only_tech:
             tech = [a for a in articles if a["cat"] == "tecnologia"]
-            return self.rank_with_gemini(tech)[:7]
-
-        if not articles:
-            return []
+            # Sin IA (si desactivada) prioriza tecnología igual
+            return tech[:7]
         q = quotas_for_today()
-        ranked = self.rank_with_gemini(articles)
-
         by_cat = {"tecnologia": [], "colombia": [], "mundial": []}
-        for a in ranked:
+        for a in articles:
             if a["cat"] in by_cat:
                 by_cat[a["cat"]].append(a)
-
         selected = []
         for cat in ["tecnologia", "colombia", "mundial"]:
             selected.extend(by_cat[cat][: q.get(cat, 0)])
-
         order = {"tecnologia": 0, "colombia": 1, "mundial": 2}
         selected.sort(key=lambda a: order.get(a["cat"], 9))
         return selected
 
+    # ---- Run ----
     def run(self):
         icons = {"tecnologia": "💻", "colombia": "🇨🇴", "mundial": "🌍"}
         titles = {"tecnologia": "TECNOLOGÍA", "colombia": "COLOMBIA", "mundial": "MUNDIAL"}
@@ -366,7 +361,6 @@ class NewsBot:
         all_articles = [a for a in all_articles if article_uid(a) not in self.sent_ids]
         selected = self.select_top_by_quota(all_articles)
 
-        # Cabecera
         header = f"📰 *{escape_markdown('Boletín de noticias')}* — {escape_markdown(datetime.now().strftime('%d/%m/%Y %H:%M'))}"
         self.send_message(header)
 
@@ -384,7 +378,6 @@ class NewsBot:
             resumen = self.summarize_extended(title_es, self.translate_force_es(desc_src), a["cat"])
 
             self.send_article(title_es, resumen, a["link"], section_title=section_title, icon=icon)
-
             self.sent_ids.add(article_uid(a))
         save_state(self.sent_ids)
 
