@@ -1,5 +1,6 @@
+# news_bot.py
 import os
-import sys
+import re
 import json
 import hashlib
 import logging
@@ -18,21 +19,20 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 logger = logging.getLogger(__name__)
 
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-GEMINI_KEY = (os.getenv("GEMINI_API_KEY") or "").strip()
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+GEMINI_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 
-REQUESTS_TIMEOUT = 10  # segundos por intento de traducción
+REQUESTS_TIMEOUT = 10  # segundos
 STATE_PATH = pathlib.Path("state_sent.json")
 
-# Fallbacks públicos (puedes cambiar el orden)
+# Fallbacks públicos de traducción
 LIBRE_ENDPOINTS = [
-    os.getenv("LIBRETRANSLATE_URL", "").strip() or None,  # si defines tu propia URL
+    (os.getenv("LIBRETRANSLATE_URL", "") or "").strip() or None,  # instancia propia (opcional)
     "https://translate.argosopentech.com/translate",
     "https://libretranslate.com/translate",
     "https://translate.astian.org/translate",
 ]
-# Si todos fallan, usamos MyMemory (gratis)
 MYMEMORY_URL = "https://api.mymemory.translated.net/get"
 
 # Fuentes RSS
@@ -69,19 +69,9 @@ NEWS_SOURCES = {
 }
 
 def quotas_for_today():
+    # Fines de semana: un poco menos de tech
     is_weekend = datetime.utcnow().weekday() >= 5
     return {"tecnologia": (7 if not is_weekend else 5), "colombia": 2, "mundial": 2}
-
-# ================== ESCAPE MARKDOWN ==================
-def escape_markdown(text: str) -> str:
-    if not text:
-        return ""
-    return (
-        text.replace("_", "\\_")
-            .replace("[", "\\[")
-            .replace("]", "\\]")
-            .replace("`", "\\`")
-    )
 
 # ================== UTIL ==================
 def chunk(text: str, limit: int = 4096):
@@ -115,8 +105,35 @@ def save_state(sent_ids: set):
     except Exception as e:
         logger.warning(f"No se pudo guardar el estado: {e}")
 
-# ================== TRADUCTORES ==================
+# ================== DETECCIÓN Y TRADUCCIÓN ==================
+def detect_lang_simple(text: str) -> str:
+    """
+    Heurística ligera: devuelve 'es' o 'en'.
+    """
+    if not text:
+        return "en"
+    t = text.lower()
+
+    es_hits = 0
+    es_words = [" el ", " la ", " los ", " las ", " de ", " del ", " una ", " un ", " y ", " que ", " como ", " en ", " por ", " más ", " aún ", " también ", " según "]
+    for w in es_words:
+        if w in " " + t + " ":
+            es_hits += 1
+    if re.search(r"[áéíóúñü]", t):
+        es_hits += 2
+
+    en_hits = 0
+    en_words = [" the ", " and ", " for ", " with ", " on ", " at ", " from ", " by ", " about ", " into ", " over ", " after ", " before ", " between ", " as "]
+    for w in en_words:
+        if w in " " + t + " ":
+            en_hits += 1
+
+    return "es" if es_hits >= en_hits else "en"
+
 def translate_via_libre(text: str) -> str:
+    """
+    Intenta traducir con varias instancias de LibreTranslate.
+    """
     if not text:
         return text
     for url in LIBRE_ENDPOINTS:
@@ -136,26 +153,35 @@ def translate_via_libre(text: str) -> str:
             else:
                 logger.debug(f"LibreTranslate {url} status {r.status_code}: {r.text[:120]}")
         except Exception as e:
-            logger.debug(f"LibreTranslate fallo {url}: {e}")
+            logger.debug(f"LibreTranslate falló {url}: {e}")
     return ""
 
 def translate_via_mymemory(text: str) -> str:
+    """
+    Traduce con MyMemory usando langpair correcto (no 'auto|es').
+    Filtra mensajes de error devolviendo "" para forzar otros fallbacks.
+    """
     if not text:
         return text
     try:
+        src = detect_lang_simple(text)  # 'en' o 'es'
+        if src == "es":
+            return text  # ya en español
         r = requests.get(
             MYMEMORY_URL,
-            params={"q": text, "langpair": "auto|es"},
+            params={"q": text, "langpair": f"{src}|es"},
             timeout=REQUESTS_TIMEOUT,
         )
         if r.ok:
             data = r.json()
             out = (data.get("responseData", {}).get("translatedText") or "").strip()
-            if out:
-                logger.info("Traducción vía MyMemory OK.")
-                return out
+            # MyMemory a veces devuelve mensajes de error como "AUTO IS AN INVALID SOURCE LANGUAGE..."
+            if not out or "INVALID SOURCE LANGUAGE" in out.upper():
+                return ""
+            logger.info("Traducción vía MyMemory OK.")
+            return out
     except Exception as e:
-        logger.debug(f"MyMemory fallo: {e}")
+        logger.debug(f"MyMemory falló: {e}")
     return ""
 
 # ================== BOT ==================
@@ -170,6 +196,7 @@ class NewsBot:
         if GEMINI_KEY:
             try:
                 genai.configure(api_key=GEMINI_KEY)
+                # Intenta el más reciente; si falla, retrocede
                 try:
                     self.model = genai.GenerativeModel("gemini-1.5-pro-latest")
                 except Exception:
@@ -198,14 +225,11 @@ class NewsBot:
             if hasattr(resp, "candidates") and resp.candidates:
                 cand = resp.candidates[0]
                 if hasattr(cand, "content") and hasattr(cand.content, "parts"):
-                    parts = cand.content.parts
                     texts = []
-                    for p in parts:
-                        t = getattr(p, "text", None)
+                    for p in cand.content.parts:
+                        t = getattr(p, "text", None) or (p.get("text") if isinstance(p, dict) else None)
                         if t:
                             texts.append(t)
-                        elif isinstance(p, dict) and "text" in p:
-                            texts.append(p["text"])
                     if texts:
                         return "".join(texts)
         except Exception:
@@ -232,8 +256,8 @@ class NewsBot:
         payload = {
             "chat_id": TELEGRAM_CHAT_ID,
             "text": text,
-            "parse_mode": "Markdown",
-            "disable_web_page_preview": False,
+            "parse_mode": "Markdown",  # simple y compatible
+            "disable_web_page_preview": False,  # deja previews e imagen cuando posible
         }
         try:
             r = requests.post(url, data=payload, timeout=20)
@@ -243,49 +267,54 @@ class NewsBot:
             logger.error(f"Error enviando a Telegram: {e}")
 
     def send_article(self, title: str, resumen: str, url: str, section_title: str = None, icon: str = ""):
-        lines = []
+        parts = []
         if section_title:
-            lines.append(f"{icon} *{escape_markdown(section_title)}*")
-        lines.append(f"• *{escape_markdown(title)}*")
+            parts.append(f"{icon} *{section_title}*")
+        parts.append(f"• *{title}*")
         if resumen:
-            lines.append(escape_markdown(resumen))
-        lines.append(url)  # texto plano para preview con imagen
-        self.send_message("\n".join(lines))
+            parts.append(resumen)
+        # URL en texto plano para que Telegram intente previsualizar
+        parts.append(url)
+        self.send_message("\n".join(parts))
 
-    # ---- IA/Traducción ----
+    # ---- Traducción + Resumen ----
     def translate_force_es(self, text: str) -> str:
         if not text:
             return text
-        # 1) Gemini (si disponible)
+
+        # 1) Gemini si disponible
         if not self.gemini_disabled and self.model:
             prompt = (
                 "Reescribe ÍNTEGRAMENTE en ESPAÑOL neutro, claro y natural. "
-                "Si ya está en español, reescríbelo mejorado. "
+                "Si ya está en español, mejóralo ligeramente. "
                 "No dejes nada en inglés. No agregues comillas ni comentarios.\n\n"
                 f"{text}"
             )
             out = self.gemini_generate(prompt)
             if out:
                 return out
-            logger.info("Gemini sin salida; usaré fallback de traducción.")
-        # 2) LibreTranslate (varias instancias)
+            logger.info("Gemini sin salida; usaré fallbacks de traducción.")
+
+        # 2) LibreTranslate (multi-endpoint)
         out = translate_via_libre(text)
         if out:
             return out
-        # 3) MyMemory
+
+        # 3) MyMemory con langpair correcto
         out = translate_via_mymemory(text)
         if out:
             return out
-        # 4) último recurso: devuelve original
+
+        # 4) Último recurso: original
         return text
 
     def summarize_extended(self, title_es: str, description_es: str, category: str) -> str:
         base = (description_es or title_es or "").strip()
-        # 1) Gemini resumen si disponible
+        # 1) Gemini para resumen si disponible
         if not self.gemini_disabled and self.model:
             prompt = (
-                "Redacta un resumen informativo en ESPAÑOL (3 a 5 frases, "
-                "máximo ~100 palabras). Explica qué pasó, por qué importa y da contexto. "
+                "Redacta un resumen informativo en ESPAÑOL (3 a 5 frases, ~100 palabras). "
+                "Explica qué pasó, por qué importa y da contexto. "
                 "NO dejes nada en inglés. No agregues comentarios ni comillas.\n\n"
                 f"Título: {title_es}\n"
                 f"Descripción: {description_es}\n"
@@ -295,7 +324,7 @@ class NewsBot:
             if out:
                 return out
             logger.info("Gemini sin salida en resumen; usaré fallback.")
-        # 2) Fallback: si parece inglés, traducir y cortar
+        # 2) Fallback: traducir/cortar
         tr = self.translate_force_es(base)
         return tr[:600]
 
@@ -338,7 +367,6 @@ class NewsBot:
     def select_top_by_quota(self, articles):
         if self.only_tech:
             tech = [a for a in articles if a["cat"] == "tecnologia"]
-            # Sin IA (si desactivada) prioriza tecnología igual
             return tech[:7]
         q = quotas_for_today()
         by_cat = {"tecnologia": [], "colombia": [], "mundial": []}
@@ -361,7 +389,7 @@ class NewsBot:
         all_articles = [a for a in all_articles if article_uid(a) not in self.sent_ids]
         selected = self.select_top_by_quota(all_articles)
 
-        header = f"📰 *{escape_markdown('Boletín de noticias')}* — {escape_markdown(datetime.now().strftime('%d/%m/%Y %H:%M'))}"
+        header = f"📰 *Boletín de noticias* — {datetime.now().strftime('%d/%m/%Y %H:%M')}"
         self.send_message(header)
 
         current_cat = None
@@ -373,11 +401,15 @@ class NewsBot:
                 section_title = titles[current_cat]
                 icon = icons[current_cat]
 
+            # Traducción y resumen
             title_es = self.translate_force_es(a["title"])
             desc_src = a["desc"] if a["desc"] else a["title"]
             resumen = self.summarize_extended(title_es, self.translate_force_es(desc_src), a["cat"])
 
+            # Enviar artículo
             self.send_article(title_es, resumen, a["link"], section_title=section_title, icon=icon)
+
+            # Registrar como enviado
             self.sent_ids.add(article_uid(a))
         save_state(self.sent_ids)
 
@@ -390,8 +422,11 @@ def parse_args():
 def main():
     args = parse_args()
     bot = NewsBot(only_tech=args.only_tech)
+
+    # Prueba rápida visible en logs (debe salir en español si todo ok)
     prueba = bot.translate_force_es("Breaking: Apple unveils a new AI feature for iPhone.")
     logger.info(f"Traducción de prueba: {prueba}")
+
     bot.run()
 
 if __name__ == "__main__":
