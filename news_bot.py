@@ -44,33 +44,48 @@ NEWS_SOURCES = {
         "https://spectrum.ieee.org/rss/fulltext",
         "https://www.technologyreview.com/feed/",
         "https://www.engadget.com/rss.xml",
-        # Blogs core (alto signal)
+        # Blogs core
         "https://ai.googleblog.com/feeds/posts/default",
         "https://openai.com/blog/rss.xml",
         "https://blogs.nvidia.com/feed/",
     ],
 }
 
-# Cupos por categoría (prioridad tecnología). Puedes ajustar.
 def quotas_for_today():
-    # Fines de semana: un poco menos de tech
+    # Fin de semana => un poco menos de tech
     is_weekend = datetime.utcnow().weekday() >= 5
     return {"tecnologia": (7 if not is_weekend else 5), "colombia": 2, "mundial": 2}
 
-# Estado persistente para evitar duplicados entre días
 STATE_PATH = pathlib.Path("state_sent.json")
 
-# ================== UTILIDADES ==================
-def escape_markdown(s: str) -> str:
-    if not s:
-        return s
-    return (
-        s.replace("_", "\\_")
-         .replace("*", "\\*")
-         .replace("[", "\\[")
-         .replace("`", "\\`")
-    )
+# ================== ESCAPES MARKDOWNV2 ==================
+def escape_markdown_v2(text: str) -> str:
+    """
+    Escapa caracteres especiales para MarkdownV2 de Telegram.
+    NO usar alrededor de los *asteriscos* que abren/cierra negrita;
+    úsalo SOLO para el contenido interior.
+    """
+    if text is None:
+        return ""
+    specials = r"_*[]()~`>#+-=|{}.!\\"
+    out = []
+    for ch in text:
+        if ch in specials:
+            out.append("\\" + ch)
+        else:
+            out.append(ch)
+    return "".join(out)
 
+def escape_url_md_v2(url: str) -> str:
+    """
+    Para URLs dentro de [texto](url) en MarkdownV2, se deben escapar '(' y ')'
+    y backslashes por seguridad.
+    """
+    if not url:
+        return ""
+    return url.replace("\\", r"\\").replace("(", r"$begin:math:text$").replace(")", r"$end:math:text$")
+
+# ================== UTILIDADES ==================
 def chunk(text: str, limit: int = 4096):
     parts = []
     t = text
@@ -114,7 +129,6 @@ class NewsBot:
         if GEMINI_KEY:
             try:
                 genai.configure(api_key=GEMINI_KEY)
-                # Rápido y actual
                 self.model = genai.GenerativeModel("gemini-1.5-flash")
                 masked = GEMINI_KEY[:4] + "..." + GEMINI_KEY[-4:]
                 logger.info(f"Gemini listo (key {masked}).")
@@ -132,7 +146,7 @@ class NewsBot:
         payload = {
             "chat_id": TELEGRAM_CHAT_ID,
             "text": text,
-            "parse_mode": "Markdown",
+            "parse_mode": "MarkdownV2",
             "disable_web_page_preview": False,
         }
         try:
@@ -285,7 +299,6 @@ class NewsBot:
     def select_top_by_quota(self, articles):
         """Ordena por importancia y aplica cupos por categoría."""
         if self.only_tech:
-            # Sin cuotas de COL/MUND si vamos solo tech
             articles = [a for a in articles if a["cat"] == "tecnologia"]
             ranked = self.rank_with_gemini(articles)
             return ranked[:7]
@@ -309,29 +322,32 @@ class NewsBot:
         return selected
 
     def create_digest_fallback(self, selected):
-        """Fallback por ítem: traduce y resume cada noticia."""
+        """Fallback por ítem: traduce y resume cada noticia (MarkdownV2)."""
         if not selected:
-            return "No hay noticias nuevas."
+            return "*No hay noticias nuevas*"
         icons = {"tecnologia": "💻", "colombia": "🇨🇴", "mundial": "🌍"}
         titles = {"tecnologia": "TECNOLOGÍA", "colombia": "COLOMBIA", "mundial": "MUNDIAL"}
 
-        text = f"📰 *Boletín de noticias* — {datetime.now().strftime('%d/%m/%Y %H:%M')}\n\n"
+        header = f"📰 *{escape_markdown_v2('Boletín de noticias')}* — {escape_markdown_v2(datetime.now().strftime('%d/%m/%Y %H:%M'))}\n\n"
+        text = header
         current_cat = None
         for a in selected:
             if a["cat"] != current_cat:
                 current_cat = a["cat"]
-                text += f"{icons[current_cat]} *{titles[current_cat]}*\n"
+                text += f"{icons[current_cat]} *{escape_markdown_v2(titles[current_cat])}*\n"
 
             title_es = self.translate_force_es(a["title"])
             desc_src = a["desc"] if a["desc"] else a["title"]
             resumen = self.summarize_extended(title_es, self.translate_force_es(desc_src), a["cat"])
 
-            title_es = escape_markdown(title_es)
-            resumen = escape_markdown(resumen)
+            title_bold = f"*{escape_markdown_v2(title_es)}*"
+            resumen_md = escape_markdown_v2(resumen)
+            link_text = escape_markdown_v2("Leer más")
+            link_url = escape_url_md_v2(a["link"])
 
-            text += f"• *{title_es}*\n{resumen}\n[Leer más]({a['link']})\n\n"
+            text += f"• {title_bold}\n{resumen_md}\n[{link_text}]({link_url})\n\n"
 
-        text += "---\n🤖 _Resumen automatizado con IA (prioridad tecnología)_"
+        text += escape_markdown_v2("---") + "\n" + "_Resumen automatizado con IA (prioridad tecnología)_"
         return text
 
     def save_report(self, text: str):
@@ -356,7 +372,8 @@ class NewsBot:
         # Intento 1: resumen batch pro (una sola llamada IA)
         digest = self.summarize_batch(selected)
         if digest:
-            digest = escape_markdown(digest)
+            # Escapar TODO el boletín batch antes de enviar
+            digest = escape_markdown_v2(digest)
         else:
             # Fallback por ítem
             digest = self.create_digest_fallback(selected)
