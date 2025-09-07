@@ -405,6 +405,68 @@ class NewsBot:
                 logger.error(f"Error con RSS {rss}: {e}")
         return arts
 
+    # ------------ Presentación (Opción B) ------------
+    def send_intro_with_categories(self, selected):
+        """Mensaje inicial: 'Boletín…' + lista de categorías presentes."""
+        if not selected:
+            return
+        icons  = {"tecnologia": "💻", "colombia": "🇨🇴", "mundial": "🌍", "medicina": "🩺"}
+        titles = {"tecnologia": "TECNOLOGÍA", "colombia": "COLOMBIA", "mundial": "MUNDIAL", "medicina": "MEDICINA"}
+
+        cats_present = []
+        seen = set()
+        for a in selected:
+            if a["cat"] not in seen:
+                seen.add(a["cat"])
+                cats_present.append(a["cat"])
+
+        header = f"📰 *{escape_md2('Boletín de noticias')}* — {escape_md2(datetime.now().strftime('%d/%m/%Y %H:%M'))}\n\n"
+        body = ""
+        for c in cats_present:
+            body += f"{icons.get(c,'📰')} *{escape_md2(titles[c])}*\n"
+        text = header + body
+        self.send_message(text)
+
+    def send_category_separator(self, cat):
+        """Sección en negrita por categoría antes de las fotos de esa categoría."""
+        icons  = {"tecnologia": "💻", "colombia": "🇨🇴", "mundial": "🌍", "medicina": "🩺"}
+        titles = {"tecnologia": "TECNOLOGÍA", "colombia": "COLOMBIA", "mundial": "MUNDIAL", "medicina": "MEDICINA"}
+        line = f"{icons.get(cat,'📰')} *{escape_md2(titles.get(cat, cat.upper()))}*"
+        self.send_message(line)
+
+    def build_caption_for_article(self, a):
+        """Caption para foto. Incluye URL desnuda al final para preview."""
+        title_es = self.translate_force_es(a["title"]) if probably_english(a["title"]) else a["title"]
+        desc_src = a["desc"] if a["desc"] else a["title"]
+        desc_es  = self.translate_force_es(desc_src) if probably_english(desc_src) else desc_src
+        resumen  = self.summarize_extended(title_es, desc_es, a["cat"])
+
+        title_bold = f"*{escape_md2(title_es)}*"
+        resumen_md = escape_md2(resumen)
+        caption = f"{title_bold}\n{resumen_md}\n{a['link']}"
+        return caption
+
+    def create_digest_textblock(self, selected):
+        """Versión solo texto (sin fotos). Incluye URL desnuda por item para preview."""
+        if not selected:
+            return "*No hay noticias nuevas*"
+        icons  = {"tecnologia": "💻", "colombia": "🇨🇴", "mundial": "🌍", "medicina": "🩺"}
+        titles = {"tecnologia": "TECNOLOGÍA", "colombia": "COLOMBIA", "mundial": "MUNDIAL", "medicina": "MEDICINA"}
+        header = f"📰 *{escape_md2('Boletín de noticias')}* — {escape_md2(datetime.now().strftime('%d/%m/%Y %H:%M'))}\n\n"
+        text = header
+        current_cat = None
+        for a in selected:
+            if a["cat"] != current_cat:
+                current_cat = a["cat"]
+                text += f"{icons[current_cat]} *{escape_md2(titles[current_cat])}*\n"
+            title_es = self.translate_force_es(a["title"]) if probably_english(a["title"]) else a["title"]
+            desc_src = a["desc"] if a["desc"] else a["title"]
+            desc_es  = self.translate_force_es(desc_src) if probably_english(desc_src) else desc_src
+            resumen  = self.summarize_extended(title_es, desc_es, a["cat"])
+            text += f"• *{escape_md2(title_es)}*\n{escape_md2(resumen)}\n{a['link']}\n\n"
+        text += escape_md2("---") + "\n" + "_Resumen automatizado con IA (prioridad tecnología/medicina)_"
+        return text
+
     # ------------ Pipeline ------------
     def collect_all(self):
         if self.only_tech:
@@ -444,40 +506,6 @@ class NewsBot:
         logger.info(f"Seleccionadas para enviar (por cupo): {counts}")
         return selected
 
-    def build_caption_for_article(self, a):
-        """Caption para foto. Incluye URL desnuda al final para preview."""
-        title_es = self.translate_force_es(a["title"]) if probably_english(a["title"]) else a["title"]
-        desc_src = a["desc"] if a["desc"] else a["title"]
-        desc_es  = self.translate_force_es(desc_src) if probably_english(desc_src) else desc_src
-        resumen  = self.summarize_extended(title_es, desc_es, a["cat"])
-
-        icons  = {"tecnologia": "💻", "colombia": "🇨🇴", "mundial": "🌍", "medicina": "🩺"}
-        title_bold = f"*{escape_md2(title_es)}*"
-        resumen_md = escape_md2(resumen)
-        caption = f"{icons.get(a['cat'],'📰')} {title_bold}\n{resumen_md}\n{a['link']}"
-        return caption
-
-    def create_digest_textblock(self, selected):
-        """Versión solo texto (sin fotos). Incluye URL desnuda por item para preview."""
-        if not selected:
-            return "*No hay noticias nuevas*"
-        icons  = {"tecnologia": "💻", "colombia": "🇨🇴", "mundial": "🌍", "medicina": "🩺"}
-        titles = {"tecnologia": "TECNOLOGÍA", "colombia": "COLOMBIA", "mundial": "MUNDIAL", "medicina": "MEDICINA"}
-        header = f"📰 *{escape_md2('Boletín de noticias')}* — {escape_md2(datetime.now().strftime('%d/%m/%Y %H:%M'))}\n\n"
-        text = header
-        current_cat = None
-        for a in selected:
-            if a["cat"] != current_cat:
-                current_cat = a["cat"]
-                text += f"{icons[current_cat]} *{escape_md2(titles[current_cat])}*\n"
-            title_es = self.translate_force_es(a["title"]) if probably_english(a["title"]) else a["title"]
-            desc_src = a["desc"] if a["desc"] else a["title"]
-            desc_es  = self.translate_force_es(desc_src) if probably_english(desc_src) else desc_src
-            resumen  = self.summarize_extended(title_es, desc_es, a["cat"])
-            text += f"• *{escape_md2(title_es)}*\n{escape_md2(resumen)}\n{a['link']}\n\n"
-        text += escape_md2("---") + "\n" + "_Resumen automatizado con IA (prioridad tecnología/medicina)_"
-        return text
-
     def run(self):
         start = datetime.now()
         all_articles = self.collect_all()
@@ -493,7 +521,15 @@ class NewsBot:
             return
 
         if TELEGRAM_USE_PHOTOS:
+            # ---- Opción B: fotos + encabezado y separadores por categoría ----
+            self.send_intro_with_categories(selected)
+
+            current = None
             for idx, a in enumerate(selected, 1):
+                if a["cat"] != current:
+                    current = a["cat"]
+                    self.send_category_separator(current)
+
                 logger.info(f"Enviando {idx}/{len(selected)}: {a['title'][:80]}...")
                 caption = self.build_caption_for_article(a)
                 if a.get("image"):
@@ -502,6 +538,7 @@ class NewsBot:
                     self.send_message(caption)
                 time.sleep(0.7)
         else:
+            # Digest de texto (encabezado y categorías en bloque)
             digest = self.summarize_batch(selected)
             if digest:
                 digest = escape_md2(digest)
@@ -526,7 +563,7 @@ def parse_args():
 def main():
     args = parse_args()
     bot = NewsBot(only_tech=args.only_tech, only_medicine=args.only_medicine)
-    # Prueba corta de traducción (debería verse en español si hay cuota)
+    # Prueba corta de traducción (debería verse en español si hay cuota o fallback)
     sample = "Breaking: Apple unveils a new AI feature for iPhone."
     test = bot.translate_force_es(sample)
     logger.info(f"Traducción de prueba: {test}")
