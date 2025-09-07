@@ -19,11 +19,12 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(
 logger = logging.getLogger(__name__)
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-GEMINI_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+GEMINI_KEY         = os.getenv("GEMINI_API_KEY", "").strip()
 
 STATE_PATH = pathlib.Path("state_sent.json")
 
+# Fuentes
 NEWS_SOURCES = {
     "tecnologia": [
         "https://techcrunch.com/feed/",
@@ -37,6 +38,13 @@ NEWS_SOURCES = {
         "https://ai.googleblog.com/feeds/posts/default",
         "https://openai.com/blog/rss.xml",
         "https://blogs.nvidia.com/feed/",
+    ],
+    "medicina": [
+        "https://www.nejm.org/action/showFeed?type=etoc&feed=rss&jc=nejm",
+        "https://www.thelancet.com/rssfeed/lancet_current.xml",
+        "https://jamanetwork.com/rss/site_6/mostRecent.xml",
+        "https://www.nature.com/subjects/medicine.rss",
+        "https://www.medscape.com/rss/all",
     ],
     "colombia": [
         "https://www.eltiempo.com/rss.xml",
@@ -52,17 +60,10 @@ NEWS_SOURCES = {
         "https://rss.cnn.com/rss/edition.rss",
         "https://www.reuters.com/rssFeed/worldNews",
     ],
-    "medicina": [
-        "https://www.nejm.org/action/showFeed?type=etoc&feed=rss&jc=nejm",
-        "https://www.thelancet.com/rssfeed/lancet_current.xml",
-        "https://jamanetwork.com/rss/site_6/mostRecent.xml",
-        "https://www.nature.com/subjects/medicine.rss",
-        "https://www.medscape.com/rss/all",
-    ],
 }
 
 def quotas_for_today():
-    # Cupos objetivo por categoría (ajustables). Luego garantizamos mínimo 1 por categoría.
+    # Cupos (ajustables). Luego garantizamos mínimo 1 por categoría.
     return {"tecnologia": 6, "medicina": 3, "colombia": 2, "mundial": 2}
 
 # ================== MARKDOWNV2 ==================
@@ -153,7 +154,6 @@ def translate_libretranslate(text: str) -> str:
 
 def translate_googletrans(text: str) -> str:
     try:
-        # Import tardío para evitar costos de import si no se usa
         from googletrans import Translator
         translator = Translator()
         out = translator.translate(text, src="en", dest="es").text
@@ -164,21 +164,17 @@ def translate_googletrans(text: str) -> str:
 
 # ================== IMÁGENES ==================
 def extract_feed_image(entry) -> str | None:
-    # RSS / media content
     try:
-        # media_content
         media = entry.get("media_content")
         if isinstance(media, list) and media:
             url = media[0].get("url")
             if url:
                 return url
-        # media_thumbnail
         thumb = entry.get("media_thumbnail")
         if isinstance(thumb, list) and thumb:
             url = thumb[0].get("url")
             if url:
                 return url
-        # itunes:image
         if "image" in entry and isinstance(entry["image"], dict):
             url = entry["image"].get("href") or entry["image"].get("url")
             if url:
@@ -249,10 +245,6 @@ class NewsBot:
         except Exception as e:
             logger.error(f"Error enviando texto: {e}")
 
-    def send_long_text(self, text: str):
-        for p in chunk(text):
-            self.send_text(p)
-
     def send_photo(self, photo_url: str, caption_md2: str):
         if not photo_url:
             return False
@@ -262,7 +254,7 @@ class NewsBot:
         data = {
             "chat_id": TELEGRAM_CHAT_ID,
             "photo": photo_url,
-            "caption": caption_md2[:1024],  # límite caption
+            "caption": caption_md2[:1024],
             "parse_mode": "MarkdownV2",
         }
         try:
@@ -279,8 +271,7 @@ class NewsBot:
     def translate_force_es(self, text: str) -> str:
         if not text:
             return text
-
-        # 0) si ya parece español, devuelve
+        # Si ya parece español, devolver
         if not looks_english(text):
             return text
 
@@ -314,12 +305,10 @@ class NewsBot:
         if out and out != text:
             return out
 
-        # 5) original
         return text
 
     def summarize_extended(self, title_es: str, description_es: str, category: str) -> str:
         base = (description_es or title_es or "").strip()
-        # IA
         if self.model:
             try:
                 prompt = (
@@ -336,13 +325,7 @@ class NewsBot:
                     return out
             except Exception as e:
                 logger.warning(f"Gemini resumen falló: {e}")
-        # Fallback
         return base[:600]
-
-    def rank_techoriented(self, articles):
-        # Heurístico: primero tecnología; luego resto como llegan.
-        # (Si quieres IA ranking, puedes reactivar aquí con Gemini y JSON)
-        return sorted(articles, key=lambda a: (a["cat"] != "tecnologia",))
 
     # -------- Recolección --------
     def get_rss(self, category: str):
@@ -351,19 +334,18 @@ class NewsBot:
             try:
                 feed = feedparser.parse(rss)
                 for entry in feed.entries[:8]:
-                    link = entry.get("link") or ""
+                    link  = entry.get("link") or ""
                     title = entry.get("title") or ""
                     if not link or not title:
                         continue
                     raw_desc = entry.get("description", "") or entry.get("summary", "")
                     desc = BeautifulSoup(raw_desc, "html.parser").get_text(" ").strip()
                     a = {
-                        "_i": len(self.processed),
                         "title": title,
-                        "desc": desc,
-                        "link": link,
-                        "cat": category,
-                        "_entry": entry,  # para intentar imagen
+                        "desc":  desc,
+                        "link":  link,
+                        "cat":   category,
+                        "_entry": entry,
                     }
                     uid = article_uid(a)
                     if uid in self.processed or uid in self.sent_ids:
@@ -381,6 +363,7 @@ class NewsBot:
         elif self.only_medicine:
             cats = ["medicina"]
         else:
+            # Orden fijo para presentación
             cats = ["tecnologia", "medicina", "colombia", "mundial"]
 
         all_articles = []
@@ -393,23 +376,26 @@ class NewsBot:
         if not articles:
             return []
 
-        ranked = self.rank_techoriented(articles)
+        # Orden preferente: tecnología primero (heurístico simple)
+        order = {"tecnologia": 0, "medicina": 1, "colombia": 2, "mundial": 3}
+        articles.sort(key=lambda a: order.get(a["cat"], 9))
+
         q = quotas_for_today()
         counts = {k: 0 for k in q}
         selected = []
 
         # 1) Llenar por cupos
-        for a in ranked:
+        for a in articles:
             if counts.get(a["cat"], 0) < q.get(a["cat"], 0):
                 selected.append(a)
                 counts[a["cat"]] += 1
             if sum(counts.values()) >= sum(q.values()):
                 break
 
-        # 2) Garantizar mínimo 1 por categoría (si existe material)
+        # 2) Garantizar mínimo 1 por categoría si hay material
         minimums = {"tecnologia": 1, "medicina": 1, "colombia": 1, "mundial": 1}
         by_cat = {"tecnologia": [], "medicina": [], "colombia": [], "mundial": []}
-        for a in ranked:
+        for a in articles:
             by_cat[a["cat"]].append(a)
 
         sel_ids = {article_uid(x) for x in selected}
@@ -424,93 +410,69 @@ class NewsBot:
                     sel_ids.add(uid)
                     break
 
-        # Orden final para presentación
-        order = {"tecnologia": 0, "medicina": 1, "colombia": 2, "mundial": 3}
+        # Orden final para presentar en secciones fijas
         selected.sort(key=lambda a: order.get(a["cat"], 9))
-        logger.info(
-            "Seleccionadas: "
-            f"tech={sum(1 for x in selected if x['cat']=='tecnologia')}, "
-            f"med={sum(1 for x in selected if x['cat']=='medicina')}, "
-            f"col={sum(1 for x in selected if x['cat']=='colombia')}, "
-            f"mun={sum(1 for x in selected if x['cat']=='mundial')}"
-        )
         return selected
 
-    def build_and_send_digest(self, selected):
-        if not selected:
-            self.send_text("*No hay noticias nuevas*")
-            return
-
-        icons  = {"tecnologia": "💻", "colombia": "🇨🇴", "mundial": "🌍", "medicina": "🩺"}
-        titles = {"tecnologia": "TECNOLOGÍA", "colombia": "COLOMBIA", "mundial": "MUNDIAL", "medicina": "MEDICINA"}
-
-        # Header general
-        header = f"📰 *{escape_md2('Boletín de noticias')}* — {escape_md2(datetime.now().strftime('%d/%m/%Y %H:%M'))}\n\n"
-        text_block = header
-
-        # Enviar 1ª noticia de cada categoría como foto si hay imagen
-        first_sent_photo_for = set()
-
-        current_cat = None
-        for a in selected:
-            # Cambió de categoría ⇒ encabezado
-            if a["cat"] != current_cat:
-                current_cat = a["cat"]
-                text_block += f"{icons.get(current_cat,'📰')} *{escape_md2(titles[current_cat])}*\n"
-
-                # Intentar foto para el primer ítem de la categoría
-                if current_cat not in first_sent_photo_for:
-                    img = get_image_for_entry(a.get("_entry", {}), a["link"])
-                    if img:
-                        title_es = self.translate_force_es(a["title"])
-                        desc_src = a["desc"] if a["desc"] else a["title"]
-                        resumen = self.summarize_extended(title_es, self.translate_force_es(desc_src), a["cat"])
-                        caption = (
-                            f"*{escape_md2(title_es)}*\n"
-                            f"{escape_md2(resumen)}\n"
-                            f"{escape_md2_url(a['link'])}"
-                        )
-                        ok = self.send_photo(img, caption)
-                        if ok:
-                            first_sent_photo_for.add(current_cat)
-                            # Marca como enviado este artículo con foto y no lo dupliques en texto
-                            self.sent_ids.add(article_uid(a))
-                            continue  # pasa al siguiente artículo (ya enviado como foto)
-
-            # Envío normal (texto)
-            title_es = self.translate_force_es(a["title"])
-            desc_src = a["desc"] if a["desc"] else a["title"]
-            resumen = self.summarize_extended(title_es, self.translate_force_es(desc_src), a["cat"])
-            text_block += (
-                f"• *{escape_md2(title_es)}*\n"
-                f"{escape_md2(resumen)}\n"
-                f"{escape_md2_url(a['link'])}\n\n"
-            )
-
-        text_block += escape_md2("---") + "\n" + "_Resumen automatizado con IA (prioridad tecnología)_"
-        self.send_long_text(text_block)
-
     def run(self):
+        # 0) Header del boletín
+        header = f"📰 *{escape_md2('Boletín de noticias')}* — {escape_md2(datetime.now().strftime('%d/%m/%Y %H:%M'))}"
+        self.send_text(header)
+
+        # 1) Recolectar y filtrar duplicados históricos
         all_articles = self.collect_all()
         all_articles = [a for a in all_articles if article_uid(a) not in self.sent_ids]
+
+        # 2) Seleccionar
         selected = self.select_top_by_quota(all_articles)
 
-        self.build_and_send_digest(selected)
+        # 3) Enviar por CATEGORÍA -> cada noticia con IMAGEN si hay
+        icons  = {"tecnologia": "💻", "medicina": "🩺", "colombia": "🇨🇴", "mundial": "🌍"}
+        titles = {"tecnologia": "TECNOLOGÍA", "medicina": "MEDICINA", "colombia": "COLOMBIA", "mundial": "MUNDIAL"}
+        order = ["tecnologia", "medicina", "colombia", "mundial"]
 
-        # Guardar estado de enviados
-        for a in selected:
-            self.sent_ids.add(article_uid(a))
+        for cat in order:
+            cat_articles = [a for a in selected if a["cat"] == cat]
+            if not cat_articles:
+                continue
+
+            # Encabezado de categoría
+            self.send_text(f"{icons[cat]} *{escape_md2(titles[cat])}*")
+
+            for a in cat_articles:
+                title_es = self.translate_force_es(a["title"])
+                desc_src = a["desc"] if a["desc"] else a["title"]
+                resumen  = self.summarize_extended(title_es, self.translate_force_es(desc_src), a["cat"])
+
+                caption = (
+                    f"*{escape_md2(title_es)}*\n"
+                    f"{escape_md2(resumen)}\n"
+                    f"{escape_md2_url(a['link'])}"
+                )
+
+                img_url = get_image_for_entry(a.get("_entry", {}), a["link"])
+                sent_ok = False
+                if img_url:
+                    sent_ok = self.send_photo(img_url, caption)
+                if not sent_ok:
+                    # fallback texto
+                    self.send_text(caption)
+
+                # Marcar enviado para no repetir en próximos runs
+                self.sent_ids.add(article_uid(a))
+
+        # 4) Footer
+        footer = escape_md2("---") + "\n" + "_Resumen automatizado con IA (prioridad tecnología)_"
+        self.send_text(footer)
+
+        # 5) Persistir estado
         save_state(self.sent_ids)
 
-        # Guardar reporte en repo
-        reports = pathlib.Path("reports")
-        reports.mkdir(exist_ok=True)
+        # 6) Guardar reporte simple en repo (opcional)
+        reports = pathlib.Path("reports"); reports.mkdir(exist_ok=True)
         fname = reports / f"boletin_{datetime.now().strftime('%Y-%m-%d_%H%M')}.md"
         try:
-            # Guardamos SOLO el texto (no incluye las fotos ya enviadas)
-            # Si quieres, puedes también persistir el bloque construido.
-            fname.write_text("Enviado vía Telegram. Ver historial en el chat.", encoding="utf-8")
-            logger.info(f"Reporte guardado en: {fname}")
+            fname.write_text("Enviado vía Telegram (ver chat).", encoding="utf-8")
         except Exception as e:
             logger.warning(f"No se pudo guardar el reporte: {e}")
 
@@ -526,12 +488,10 @@ def parse_args():
 def main():
     args = parse_args()
     bot = NewsBot(only_tech=args.only_tech, only_medicine=args.only_medicine)
-    # Prueba rápida de traducción
+    # Prueba visible en logs
     prueba = bot.translate_force_es("Breaking: Apple unveils a new AI feature for iPhone.")
     logger.info(f"Traducción de prueba: {prueba}")
-    logger.info("Generando y enviando boletín...")
     bot.run()
-    logger.info("Listo.")
 
 if __name__ == "__main__":
     main()
