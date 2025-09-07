@@ -23,7 +23,7 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 GEMINI_KEY = (os.getenv("GEMINI_API_KEY") or "").strip()
 NEWSAPI_KEY = (os.getenv("NEWSAPI_KEY") or "").strip()  # opcional
 
-# Fuentes RSS (fuerte en tecnología)
+# Fuentes RSS (fuerte en tecnología y ampliado Colombia)
 NEWS_SOURCES = {
     "mundial": [
         "https://feeds.bbci.co.uk/news/world/rss.xml",
@@ -34,6 +34,11 @@ NEWS_SOURCES = {
         "https://www.eltiempo.com/rss.xml",
         "https://www.semana.com/rss.xml",
         "https://www.elespectador.com/rss.xml",
+        "https://www.portafolio.co/rss/portada.xml",
+        "https://www.bluradio.com/rss/colombia.xml",
+        "https://caracol.com.co/rss/colombia.xml",
+        "https://www.wradio.com.co/rss/colombia.xml",
+        "https://www.elcolombiano.com/rss/colombia",
     ],
     "tecnologia": [
         "https://techcrunch.com/feed/",
@@ -135,8 +140,8 @@ class NewsBot:
         payload = {
             "chat_id": TELEGRAM_CHAT_ID,
             "text": text,
-            "parse_mode": "Markdown",          # <— Volvemos a Markdown clásico
-            "disable_web_page_preview": False, # <— Permite previews
+            "parse_mode": "Markdown",          # Markdown clásico
+            "disable_web_page_preview": False, # Permite previews
         }
         try:
             r = requests.post(url, data=payload, timeout=25)
@@ -167,20 +172,26 @@ class NewsBot:
 
     # ------------ IA helpers ------------
     def translate_force_es(self, text: str) -> str:
-        """Fuerza traducción al español (sin detector)."""
+        """Fuerza traducción al español con reintento simple."""
         if not text:
             return text
         if not self.model:
+            logger.warning("Gemini no inicializado: envío sin traducir.")
             return text
+        prompt = (
+            "Traduce al español de forma natural y clara. "
+            "No agregues comentarios ni comillas. Solo el texto traducido.\n\n"
+            f"{text}"
+        )
         try:
-            prompt = (
-                "Traduce al español de forma natural y clara. "
-                "No agregues comentarios ni comillas. Solo el texto traducido.\n\n"
-                f"{text}"
-            )
             resp = self.model.generate_content(prompt)
             out = (getattr(resp, "text", "") or "").strip()
-            return out or text
+            if out:
+                return out
+            # Reintento si vino vacío
+            resp2 = self.model.generate_content(prompt)
+            out2 = (getattr(resp2, "text", "") or "").strip()
+            return out2 or text
         except Exception as e:
             logger.error(f"Error traduciendo: {e}")
             return text
@@ -274,28 +285,37 @@ class NewsBot:
         return all_articles
 
     def select_top_by_quota(self, articles):
-        """Ordena por importancia y aplica cupos por categoría."""
+        """
+        Ordena por importancia y GARANTIZA cupos por categoría (si hay artículos).
+        """
         if self.only_tech:
-            articles = [a for a in articles if a["cat"] == "tecnologia"]
-            ranked = self.rank_with_gemini(articles)
+            tech = [a for a in articles if a["cat"] == "tecnologia"]
+            ranked = self.rank_with_gemini(tech)
             return ranked[:7]
 
         if not articles:
             return []
         q = quotas_for_today()
         ranked = self.rank_with_gemini(articles)
-        counts = {k: 0 for k in q}
-        selected = []
+
+        # Agrupa por categoría preservando el orden del ranking
+        by_cat = {"tecnologia": [], "colombia": [], "mundial": []}
         for a in ranked:
-            if counts.get(a["cat"], 0) < q.get(a["cat"], 0):
-                selected.append(a)
-                counts[a["cat"]] += 1
-            if sum(counts.values()) >= sum(q.values()):
-                break
+            if a["cat"] in by_cat:
+                by_cat[a["cat"]].append(a)
+
+        # Toma hasta el cupo disponible por categoría (si hay)
+        selected = []
+        for cat in ["tecnologia", "colombia", "mundial"]:
+            selected.extend(by_cat[cat][: q.get(cat, 0)])
+
         # Orden final para presentación
         order = {"tecnologia": 0, "colombia": 1, "mundial": 2}
         selected.sort(key=lambda a: order.get(a["cat"], 9))
-        logger.info(f"Seleccionadas por cuota: {counts}")
+        logger.info({
+            "disponibles": {k: len(v) for k, v in by_cat.items()},
+            "tomadas": {k: len([x for x in selected if x['cat']==k]) for k in by_cat}
+        })
         return selected
 
     def run(self):
@@ -304,7 +324,7 @@ class NewsBot:
         titles = {"tecnologia": "TECNOLOGÍA", "colombia": "COLOMBIA", "mundial": "MUNDIAL"}
 
         all_articles = self.collect_all()
-        # filtra artículos ya enviados
+        # Filtra artículos ya enviados
         all_articles = [a for a in all_articles if article_uid(a) not in self.sent_ids]
         selected = self.select_top_by_quota(all_articles)
 
