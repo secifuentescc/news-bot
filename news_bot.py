@@ -19,8 +19,8 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(
 logger = logging.getLogger(__name__)
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-GEMINI_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+GEMINI_KEY         = os.getenv("GEMINI_API_KEY", "").strip()
 
 STATE_PATH = pathlib.Path("state_sent.json")
 
@@ -63,6 +63,24 @@ NEWS_SOURCES = {
     ],
 }
 
+# --- (1) Agregamos fuentes nuevas sin borrar las existentes ---
+NEWS_SOURCES["tecnologia"] += [
+    "https://www.apple.com/newsroom/rss-feed.rss",            # Apple Newsroom
+    "https://developer.apple.com/news/releases/rss.xml",      # Apple Developer releases
+    "https://iosdevweekly.com/issues.rss",                    # iOS Dev Weekly
+    "https://android-developers.googleblog.com/atom.xml",     # Android Developers Blog
+    "https://news.ycombinator.com/rss",                       # Hacker News
+    "http://export.arxiv.org/rss/cs.AI",                      # arXiv AI
+    "https://github.blog/changelog/feed/",                    # GitHub Changelog
+]
+
+NEWS_SOURCES["medicina"] += [
+    "https://www.fda.gov/about-fda/newsroom/press-announcements/rss.xml",  # FDA PR
+    "https://www.nih.gov/news-events/news-releases.xml",                   # NIH
+    "https://www.who.int/rss-feeds/news-english.xml",                      # WHO (inglés)
+    "https://www.medrxiv.org/rss/latest.xml",                              # medRxiv preprints
+]
+
 def quotas_for_today():
     # Cupos por categoría (ajustables). Garantizamos mínimo 1 más abajo.
     return {"tecnologia": 6, "medicina": 3, "colombia": 2, "mundial": 2}
@@ -75,7 +93,7 @@ def escape_md2(text: str) -> str:
     return re.sub(r'([_*\[\]()~`>#+\-=|{}.!\\])', r'\\\1', text)
 
 def escape_md2_url(url: str) -> str:
-    """Escapa URL para usarla en texto MDV2 (sin []) para evitar roturas)."""
+    """Escapa URL para usarla en texto MDV2 (sin [] para evitar roturas)."""
     if not url:
         return ""
     return re.sub(r'([_*$begin:math:display$$end:math:display$()~`>#+\-=|{}.!\\])', r'\\\1', url)
@@ -120,7 +138,6 @@ def get_image_for_entry(entry: dict, fallback_link: str) -> str | None:
     - enclosure url con tipo imagen
     - primer <img> en summary/detail
     """
-    # 1) media:content / media:thumbnail
     media_content = entry.get("media_content") or entry.get("media:content")
     if isinstance(media_content, list) and media_content:
         url = media_content[0].get("url")
@@ -141,7 +158,6 @@ def get_image_for_entry(entry: dict, fallback_link: str) -> str | None:
         if url:
             return url
 
-    # 2) enclosure
     enclosures = entry.get("enclosures") or []
     for enc in enclosures:
         typ = enc.get("type", "")
@@ -149,7 +165,6 @@ def get_image_for_entry(entry: dict, fallback_link: str) -> str | None:
         if url and ("image" in typ or url.lower().endswith((".jpg", ".jpeg", ".png", ".webp"))):
             return url
 
-    # 3) primer <img> en summary/detail
     for key in ("summary", "summary_detail", "content", "description"):
         val = entry.get(key)
         if isinstance(val, dict):
@@ -162,7 +177,6 @@ def get_image_for_entry(entry: dict, fallback_link: str) -> str | None:
             if img and img.get("src"):
                 return img.get("src")
 
-    # Sin imagen
     return None
 
 # ================== BOT ==================
@@ -232,7 +246,7 @@ class NewsBot:
 
     # ------------ Traducción / Resumen ------------
     def translate_force_es(self, text: str) -> str:
-        """Fuerza traducción al español. Gemini primero; si falla, MyMemory."""
+        """Fuerza traducción al español. Gemini primero; si falla, MyMemory; si falla, original."""
         if not text:
             return text
 
@@ -251,7 +265,7 @@ class NewsBot:
             except Exception as e:
                 logger.warning(f"Gemini traducción falló: {e}")
 
-        # 2) Fallback: MyMemory
+        # 2) Fallback: MyMemory (en->es)
         try:
             r = requests.get(
                 "https://api.mymemory.translated.net/get",
@@ -271,29 +285,43 @@ class NewsBot:
         return text
 
     def summarize_extended(self, title_es: str, description_es: str, category: str) -> str:
-        """Resumen 3–5 frases con contexto. Fallback: descripción limpia."""
+        """
+        Resumen extendido (~90–130 palabras) con:
+        - Qué pasó (quién/qué/cuándo/dónde)
+        - Contexto/antecedentes
+        - Por qué importa (impacto)
+        - Qué viene después
+        Fallback: trozo de la descripción.
+        """
         base = (description_es or title_es or "").strip()
         if not self.model:
-            return base[:600]
+            # Sin IA: devolvemos descripción un poco más larga, limitada para caption.
+            return base[:700]
+
         try:
             prompt = (
-                "Redacta un resumen informativo en español (3 a 5 frases, "
-                "máximo ~100 palabras) sobre la noticia. Explica qué pasó, "
-                "por qué importa y da contexto. Sin opiniones ni emojis.\n\n"
-                f"Título: {title_es}\n"
-                f"Descripción/Extracto: {description_es}\n"
-                f"Categoría: {category.upper()}\n"
+                "Escribe un resumen extendido en español, claro y profesional, de ~100–130 palabras. "
+                "Incluye: qué pasó (quién/qué/cuándo/dónde), contexto breve, por qué importa (impacto) "
+                "y qué viene después. Evita opiniones, emojis y listas; un solo párrafo fluido. "
+                "No repitas el título.\n\n"
+                f"CATEGORÍA: {category.upper()}\n"
+                f"TÍTULO: {title_es}\n"
+                f"TEXTO/EXTRACTO:\n{description_es}\n"
             )
             resp = self.model.generate_content(prompt)
             out = (getattr(resp, "text", "") or "").strip()
-            return out or base[:600]
+            # Seguridad de longitud para caption de foto (dejamos margen)
+            if len(out) > 700:
+                out = out[:700]
+            return out or base[:700]
         except Exception as e:
-            logger.warning(f"Gemini resumen falló: {e}")
-            return base[:600]
+            logger.warning(f"Gemini resumen extendido falló: {e}")
+            return base[:700]
 
     def rank_with_gemini(self, articles):
-        """Puntúa importancia (0-10) priorizando tecnología; fallback heurístico."""
+        """Puntúa importancia (0-10) priorizando tecnología; fallback heurístico simple."""
         if not self.model or not articles:
+            # Heurística mínima: tecnología primero
             return sorted(articles, key=lambda a: (a["cat"] != "tecnologia",))
         try:
             packed = "\n".join(
@@ -440,9 +468,9 @@ class NewsBot:
             self.send_text(f"{icons.get(cat,'📰')} *{escape_md2(titles[cat])}*")
 
             for a in cat_articles:
-                # === (ÚNICO CAMBIO) TRADUCIR TÍTULO ANTES DE ESCAPAR Y ARMAR CAPTION ===
+                # Traducimos título SIEMPRE antes de escapar
                 raw_title = a["title"]
-                title_es = self.translate_force_es(raw_title)
+                title_es  = self.translate_force_es(raw_title)
 
                 desc_src = a["desc"] if a["desc"] else raw_title
                 resumen  = self.summarize_extended(title_es, self.translate_force_es(desc_src), a["cat"])
@@ -474,11 +502,7 @@ class NewsBot:
         reports.mkdir(exist_ok=True)
         fname = reports / f"boletin_{datetime.now().strftime('%Y-%m-%d_%H%M')}.md"
         try:
-            # Guardamos el texto simple del último footer como marcador y el header
-            fname.write_text(
-                f"{header}\n\n" + "Reporte enviado por Telegram.\n",
-                encoding="utf-8",
-            )
+            fname.write_text(f"{header}\n\nReporte enviado por Telegram.\n", encoding="utf-8")
             logger.info(f"Reporte guardado en: {fname}")
         except Exception as e:
             logger.warning(f"No se pudo guardar el reporte: {e}")
@@ -495,7 +519,7 @@ def parse_args():
 def main():
     args = parse_args()
     bot = NewsBot(only_tech=args.only_tech, only_medicine=args.only_medicine)
-    # Prueba visible en logs (ahora debe salir traducido)
+    # Prueba visible en logs (traducción)
     prueba = bot.translate_force_es("Breaking: Apple unveils a new AI feature for iPhone.")
     logger.info(f"Traducción de prueba: {prueba}")
     logger.info("Generando y enviando boletín...")
