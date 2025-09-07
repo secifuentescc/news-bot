@@ -1,5 +1,5 @@
+# news_bot.py
 import os
-import sys
 import json
 import hashlib
 import logging
@@ -8,11 +8,17 @@ from datetime import datetime
 import pathlib
 import re
 import time
+
 import requests
 import feedparser
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
-import google.generativeai as genai
+
+# Gemini (opcional, si tienes key)
+try:
+    import google.generativeai as genai
+except Exception:
+    genai = None
 
 # ================== CONFIG ==================
 load_dotenv()
@@ -24,7 +30,7 @@ TELEGRAM_BOT_TOKEN = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
 TELEGRAM_CHAT_ID   = (os.getenv("TELEGRAM_CHAT_ID") or "").strip()
 GEMINI_KEY         = (os.getenv("GEMINI_API_KEY") or "").strip()
 
-# CONTROL: usar fotos cuando haya imagen en el RSS
+# Control de imágenes en Telegram
 TELEGRAM_USE_PHOTOS = (os.getenv("TELEGRAM_USE_PHOTOS", "true").lower() == "true")
 
 STATE_PATH = pathlib.Path("state_sent.json")
@@ -68,6 +74,7 @@ NEWS_SOURCES = {
 }
 
 def quotas_for_today():
+    # Prioriza tecnología y medicina
     is_weekend = datetime.utcnow().weekday() >= 5
     return {
         "tecnologia": (7 if not is_weekend else 5),
@@ -144,7 +151,7 @@ class NewsBot:
         self.sent_ids = load_state()
 
         self.model = None
-        if GEMINI_KEY:
+        if GEMINI_KEY and genai:
             try:
                 genai.configure(api_key=GEMINI_KEY)
                 self.model = genai.GenerativeModel("gemini-1.5-pro")
@@ -153,46 +160,57 @@ class NewsBot:
             except Exception as e:
                 logger.warning(f"No se pudo inicializar Gemini: {e}")
         else:
-            logger.warning("GEMINI_API_KEY no definido: sin traducción/resúmenes de IA.")
+            logger.warning("GEMINI_API_KEY no definido o lib no disponible: sin traducción/resúmenes de IA.")
 
     # ------------ Transporte ------------
+    def _telegram_post(self, url: str, data: dict, what: str):
+        """POST con log exhaustivo para diagnosticar."""
+        try:
+            r = requests.post(url, data=data, timeout=25)
+            try:
+                body = r.json()
+            except Exception:
+                body = r.text[:400]
+            logging.info(f"Telegram {what}: status={r.status_code} ok={r.ok} body={body}")
+            return r
+        except Exception as e:
+            logging.error(f"Telegram {what} exception: {e}")
+            return None
+
     def send_message(self, text: str):
         if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
             logger.error("Faltan TELEGRAM_BOT_TOKEN o TELEGRAM_CHAT_ID.")
             return
-        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        base_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
+        # 1) Intento con MarkdownV2
         payload = {
             "chat_id": TELEGRAM_CHAT_ID,
             "text": text,
             "parse_mode": "MarkdownV2",
-            "disable_web_page_preview": False,  # permitir tarjetas si hay URL "desnuda"
+            "disable_web_page_preview": False,
         }
-        try:
-            r = requests.post(url, data=payload, timeout=25)
-            if not r.ok:
-                logger.error(f"Telegram error: {r.text}")
-        except Exception as e:
-            logger.error(f"Error enviando a Telegram: {e}")
+        r = self._telegram_post(f"{base_url}/sendMessage", payload, "sendMessage(MD2)")
+        if r is not None and r.ok:
+            return
+        # 2) Fallback sin parse_mode
+        payload.pop("parse_mode", None)
+        self._telegram_post(f"{base_url}/sendMessage", payload, "sendMessage(plain)")
 
     def send_photo(self, photo_url: str, caption_md2: str):
         """Envía foto con caption en MarkdownV2. Si falla, cae a send_message."""
         if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
             logger.error("Faltan TELEGRAM_BOT_TOKEN o TELEGRAM_CHAT_ID.")
             return
-        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
+        base_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
         payload = {
             "chat_id": TELEGRAM_CHAT_ID,
             "photo": photo_url,
-            "caption": caption_md2[:1024],  # límite prudente para caption
+            "caption": caption_md2[:1024],
             "parse_mode": "MarkdownV2",
         }
-        try:
-            r = requests.post(url, data=payload, timeout=25)
-            if r.ok:
-                return
-            logger.warning(f"sendPhoto falló, usaré texto. Detalle: {r.text}")
-        except Exception as e:
-            logger.warning(f"sendPhoto excepción, usaré texto: {e}")
+        r = self._telegram_post(f"{base_url}/sendPhoto", payload, "sendPhoto(MD2)")
+        if r is not None and r.ok:
+            return
         # fallback a texto
         self.send_message(caption_md2 + "\n" + photo_url)
 
@@ -238,10 +256,12 @@ class NewsBot:
     def translate_force_es(self, text: str) -> str:
         if not text:
             return text
+        # 1) Gemini
         out = self.translate_gemini(text)
         if out:
             return out
         logger.info("Gemini sin salida; usaré fallback de traducción.")
+        # 2) MyMemory
         out = self.translate_mymemory(text, assume_en=probably_english(text))
         return out or text
 
@@ -296,6 +316,7 @@ class NewsBot:
     # ------------ Ranking ------------
     def rank_with_gemini(self, articles):
         if not self.model or not articles:
+            # Heurística: prioriza tecnología/medicina
             return sorted(articles, key=lambda a: (a["cat"] not in ("tecnologia","medicina"),))
         try:
             packed = "\n".join(
@@ -324,27 +345,27 @@ class NewsBot:
     # ------------ Extraer imagen del RSS ------------
     def pick_image_from_entry(self, entry) -> str | None:
         """Intenta obtener una URL de imagen del entry RSS."""
-        # 1) media:content
-        media_content = getattr(entry, "media_content", None)
-        if media_content and isinstance(media_content, list):
-            for m in media_content:
+        # media:content
+        mc = getattr(entry, "media_content", None)
+        if mc and isinstance(mc, list):
+            for m in mc:
                 url = m.get("url")
                 if url and url.startswith("http"):
                     return url
-        # 2) media_thumbnail
+        # media_thumbnail
         thumbs = getattr(entry, "media_thumbnail", None)
         if thumbs and isinstance(thumbs, list):
             for t in thumbs:
                 url = t.get("url")
                 if url and url.startswith("http"):
                     return url
-        # 3) enclosure
+        # enclosure
         for link in entry.get("links", []):
             if link.get("rel") == "enclosure" and "image" in (link.get("type") or ""):
                 url = link.get("href")
                 if url and url.startswith("http"):
                     return url
-        # 4) og:image dentro de summary/detail (algunos feeds lo incrustan)
+        # img incrustada en summary/description
         raw_desc = entry.get("summary", "") or entry.get("description", "")
         if raw_desc:
             soup = BeautifulSoup(raw_desc, "html.parser")
@@ -420,11 +441,11 @@ class NewsBot:
 
         order = {"tecnologia": 0, "medicina": 1, "colombia": 2, "mundial": 3}
         selected.sort(key=lambda a: order.get(a["cat"], 9))
-        logger.info(f"Seleccionadas por cuota: {counts}")
+        logger.info(f"Seleccionadas para enviar (por cupo): {counts}")
         return selected
 
     def build_caption_for_article(self, a):
-        """Caption corto para foto (máx ~1000 chars). Incluye URL desnuda al final para preview si falla la foto."""
+        """Caption para foto. Incluye URL desnuda al final para preview."""
         title_es = self.translate_force_es(a["title"]) if probably_english(a["title"]) else a["title"]
         desc_src = a["desc"] if a["desc"] else a["title"]
         desc_es  = self.translate_force_es(desc_src) if probably_english(desc_src) else desc_src
@@ -433,8 +454,6 @@ class NewsBot:
         icons  = {"tecnologia": "💻", "colombia": "🇨🇴", "mundial": "🌍", "medicina": "🩺"}
         title_bold = f"*{escape_md2(title_es)}*"
         resumen_md = escape_md2(resumen)
-
-        # IMPORTANTE: URL "desnuda" al final para que Telegram intente generar preview si no hay imagen
         caption = f"{icons.get(a['cat'],'📰')} {title_bold}\n{resumen_md}\n{a['link']}"
         return caption
 
@@ -462,22 +481,27 @@ class NewsBot:
     def run(self):
         start = datetime.now()
         all_articles = self.collect_all()
+        logger.info(f"Total recolectadas (antes de filtro enviados): {len(all_articles)}")
         all_articles = [a for a in all_articles if article_uid(a) not in self.sent_ids]
-        selected = self.select_top_by_quota(all_articles)
+        logger.info(f"Tras filtrar ya enviados: {len(all_articles)}")
 
-        # Si vamos con fotos, mandamos cada artículo por separado (respetando límites)
+        selected = self.select_top_by_quota(all_articles)
+        logger.info(f"Seleccionadas para enviar: {len(selected)}")
+
+        if not selected:
+            self.send_message("ℹ️ No encontré noticias nuevas para hoy. El bot está activo.")
+            return
+
         if TELEGRAM_USE_PHOTOS:
             for idx, a in enumerate(selected, 1):
+                logger.info(f"Enviando {idx}/{len(selected)}: {a['title'][:80]}...")
                 caption = self.build_caption_for_article(a)
                 if a.get("image"):
                     self.send_photo(a["image"], caption)
                 else:
-                    # sin imagen → al menos texto con URL desnuda para preview
                     self.send_message(caption)
-                # pausa corta para no golpear rate-limits
                 time.sleep(0.7)
         else:
-            # bloque de texto único (con URL desnuda por item)
             digest = self.summarize_batch(selected)
             if digest:
                 digest = escape_md2(digest)
@@ -485,7 +509,6 @@ class NewsBot:
                 digest = self.create_digest_textblock(selected)
             self.send_long(digest)
 
-        # Persistir IDs
         for a in selected:
             self.sent_ids.add(article_uid(a))
         save_state(self.sent_ids)
@@ -503,6 +526,7 @@ def parse_args():
 def main():
     args = parse_args()
     bot = NewsBot(only_tech=args.only_tech, only_medicine=args.only_medicine)
+    # Prueba corta de traducción (debería verse en español si hay cuota)
     sample = "Breaking: Apple unveils a new AI feature for iPhone."
     test = bot.translate_force_es(sample)
     logger.info(f"Traducción de prueba: {test}")
