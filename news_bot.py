@@ -4,6 +4,7 @@ import json
 import hashlib
 import logging
 import argparse
+import time
 from datetime import datetime
 import pathlib
 import requests
@@ -86,18 +87,15 @@ NEWS_SOURCES = {
 }
 
 def quotas_for_today():
-    # Cupos por categoría (ajustables). Garantizamos mínimo 1 más abajo.
     return {"tecnologia": 8, "medicina": 4, "colombia": 3, "mundial": 3}
 
 # ================== MARKDOWNV2 ESCAPES ==================
 def escape_md2(text: str) -> str:
-    """Escapa caracteres especiales para MDV2 (solo contenido)."""
     if text is None:
         return ""
     return re.sub(r'([_*\[\]()~`>#+\-=|{}.!\\])', r'\\\1', text)
 
 def escape_md2_url(url: str) -> str:
-    """Escapa URL para usarla en texto MDV2 (sin [] para evitar roturas)."""
     if not url:
         return ""
     return re.sub(r'([_*$begin:math:display$$end:math:display$()~`>#+\-=|{}.!\\])', r'\\\1', url)
@@ -179,11 +177,6 @@ def get_image_for_entry(entry: dict, fallback_link: str) -> str | None:
 
 # ================== ENRIQUECIMIENTO DE TEXTO (sin IA) ==================
 def fetch_article_snippet(url: str, min_len: int = 300, max_len: int = 900) -> str | None:
-    """
-    Si la descripción RSS es muy corta, intentamos obtener 1 párrafo bueno del HTML:
-    - Descargamos con timeout corto
-    - Tomamos el <p> más largo (visible) dentro de límites
-    """
     try:
         r = requests.get(url, timeout=6, headers={"User-Agent": "Mozilla/5.0"})
         if not r.ok or not r.text:
@@ -194,7 +187,6 @@ def fetch_article_snippet(url: str, min_len: int = 300, max_len: int = 900) -> s
             txt = p.get_text(" ", strip=True)
             if not txt:
                 continue
-            # quitar cosas obvias
             if "cookie" in txt.lower() or "suscríbete" in txt.lower() or "subscribe" in txt.lower():
                 continue
             if len(txt) >= min_len:
@@ -206,18 +198,13 @@ def fetch_article_snippet(url: str, min_len: int = 300, max_len: int = 900) -> s
     except Exception:
         return None
 
-# ================== TRADUCCIÓN ROBUSTA (helpers globales) ==================
+# ================== TRADUCCIÓN ROBUSTA ==================
 def _chunk_text_for_mymemory(text: str, max_len: int = 480):
-    """
-    Divide el texto en trozos <= max_len cuidando no cortar palabras.
-    Preferimos cortar en punto, luego espacio.
-    """
     if not text:
         return []
     text = text.strip()
     if len(text) <= max_len:
         return [text]
-
     chunks, buf = [], []
     count = 0
     sentences = re.split(r'(?<=[\.\!\?])\s+', text)
@@ -254,9 +241,6 @@ def _chunk_text_for_mymemory(text: str, max_len: int = 480):
     return chunks
 
 def _looks_spanish(text: str) -> bool:
-    """
-    Heurística ligera para evitar traducir lo que ya está en español.
-    """
     if not text:
         return False
     low = text.lower()
@@ -266,6 +250,59 @@ def _looks_spanish(text: str) -> bool:
     accents = any(c in low for c in "áéíóúñ")
     return hits >= 3 or accents
 
+# ===== Argos Translate (offline) =====
+_ARGOS_READY = False
+def ensure_argos_en_es():
+    """
+    Garantiza que el paquete EN->ES de Argos esté instalado.
+    Descarga el modelo la primera vez (requiere internet).
+    """
+    global _ARGOS_READY
+    if _ARGOS_READY:
+        return True
+    try:
+        import argostranslate.package, argostranslate.translate  # noqa
+        # ¿Ya hay traducción en->es?
+        installed = argostranslate.translate.get_installed_languages()
+        en = next((l for l in installed if l.code.startswith("en")), None)
+        es = next((l for l in installed if l.code.startswith("es")), None)
+        if en and es:
+            paths = [t for t in en.translations if t.to_language.code.startswith("es")]
+            if paths:
+                _ARGOS_READY = True
+                return True
+
+        # Instalar paquete EN->ES
+        argostranslate.package.update_package_index()
+        available = argostranslate.package.get_available_packages()
+        pkg = next((p for p in available if p.from_code.startswith("en") and p.to_code.startswith("es")), None)
+        if not pkg:
+            logger.warning("No encontré paquete Argos EN->ES en el índice.")
+            return False
+        dl_path = pkg.download()
+        argostranslate.package.install_from_path(dl_path)
+        _ARGOS_READY = True
+        logger.info("Modelo Argos EN->ES instalado.")
+        return True
+    except Exception as e:
+        logger.warning(f"Argos no disponible: {e}")
+        return False
+
+def argos_translate_en_es(text: str) -> str | None:
+    try:
+        import argostranslate.translate as argot
+        installed = argot.get_installed_languages()
+        en = next((l for l in installed if l.code.startswith("en")), None)
+        es = next((l for l in installed if l.code.startswith("es")), None)
+        if not en or not es:
+            return None
+        translator = next((t for t in en.translations if t.to_language.code.startswith("es")), None)
+        if not translator:
+            return None
+        return translator.translate(text)
+    except Exception:
+        return None
+
 # ================== BOT ==================
 class NewsBot:
     def __init__(self, only_tech: bool = False, only_medicine: bool = False):
@@ -273,6 +310,7 @@ class NewsBot:
         self.only_medicine = only_medicine
         self.processed = set()
         self.sent_ids = load_state()
+        self.tcache = {}  # caché simple de traducción
 
         # Inicializa Gemini (opcional)
         self.model = None
@@ -286,6 +324,9 @@ class NewsBot:
                 logger.warning(f"No se pudo inicializar Gemini: {e}")
         else:
             logger.warning("GEMINI_API_KEY no definido: no habrá traducción/resumen IA.")
+
+        # Prepara Argos offline (no es obligatorio, pero lo intentamos)
+        ensure_argos_en_es()
 
     # ------------ Transporte ------------
     def send_text(self, text: str):
@@ -314,7 +355,7 @@ class NewsBot:
         payload = {
             "chat_id": TELEGRAM_CHAT_ID,
             "photo": photo_url,
-            "caption": caption[:1024],   # límite de caption Telegram
+            "caption": caption[:1024],
             "parse_mode": "MarkdownV2",
         }
         try:
@@ -334,16 +375,24 @@ class NewsBot:
     # ------------ Traducción / Resumen ------------
     def translate_force_es(self, text: str) -> str:
         """
-        Fuerza traducción al español.
-        1) Si ya parece español, devuelve tal cual.
-        2) Intenta Gemini (si está disponible).
-        3) Fallback: MyMemory troceando en <=480 chars para evitar 'max allowed query: 500 chars'.
-        4) Si todo falla, devuelve el original.
+        Orden de traducción muy estable:
+        0) Cache
+        1) Si parece español, devolver tal cual.
+        2) Gemini (si disponible).
+        3) Argos Translate (offline EN->ES).
+        4) MyMemory (chunked, con pequeño delay para evitar rate-limit).
+        5) Original.
         """
         if not text:
             return text
 
+        # Cache
+        key = ("en-es", text[:1000])  # clave simple (máx 1000 chars para no crecer mucho)
+        if key in self.tcache:
+            return self.tcache[key]
+
         if _looks_spanish(text):
+            self.tcache[key] = text
             return text
 
         # 1) Gemini
@@ -357,18 +406,31 @@ class NewsBot:
                 resp = self.model.generate_content(prompt)
                 out = (getattr(resp, "text", "") or "").strip()
                 if out:
+                    self.tcache[key] = out
                     return out
             except Exception as e:
                 logger.warning(f"Gemini traducción falló: {e}")
 
-        # 2) MyMemory (chunked)
+        # 2) Argos offline
+        try:
+            if ensure_argos_en_es():
+                out = argos_translate_en_es(text)
+                if out:
+                    logger.info("Traducción vía Argos (offline) OK.")
+                    self.tcache[key] = out
+                    return out
+        except Exception as e:
+            logger.warning(f"Argos falló: {e}")
+
+        # 3) MyMemory (chunked + delay leve)
         try:
             parts = _chunk_text_for_mymemory(text, max_len=480)
             translated_parts = []
-            for p in parts:
+            for i, p in enumerate(parts):
                 r = requests.get(
                     "https://api.mymemory.translated.net/get",
                     params={"q": p, "langpair": "en|es"},
+                    headers={"User-Agent": "Mozilla/5.0"},
                     timeout=12,
                 )
                 if r.ok:
@@ -377,21 +439,22 @@ class NewsBot:
                 else:
                     frag = p
                 translated_parts.append(frag)
+                # Pausa pequeña para evitar "max queries/min"
+                if i < len(parts) - 1:
+                    time.sleep(0.5)
             out = " ".join(translated_parts).strip()
             if out:
                 logger.info("Traducción vía MyMemory OK (chunked).")
+                self.tcache[key] = out
                 return out
         except Exception as e:
             logger.warning(f"MyMemory (chunked) falló: {e}")
 
-        # 3) Original
+        # 4) Original
+        self.tcache[key] = text
         return text
 
     def summarize_extended(self, title_es: str, base_es: str, category: str) -> str:
-        """
-        Resumen extendido (~120–160 palabras). Con IA si hay cuota, si no:
-        usamos base_es (ya traducido y/o enriquecido).
-        """
         if self.model:
             try:
                 prompt = (
@@ -411,21 +474,13 @@ class NewsBot:
                     return out
             except Exception as e:
                 logger.warning(f"Gemini resumen extendido falló: {e}")
-
         return base_es[:900]
 
     def rank_with_gemini(self, articles):
-        """
-        Ranking con IA si hay, y además reforzamos prioridades manuales:
-        - Peso extra fuerte: Apple/iOS/Swift, JavaScript, Python, AI/ML, DevTools, GitHub.
-        """
         KW_BOOST = {
-            # Apple / iOS
             "apple": 2.2, "ios": 2.2, "iphone": 1.8, "ipad": 1.6, "mac": 1.4, "swift": 2.0, "xcode": 1.9, "wwdc": 2.2,
-            # Dev
             "javascript": 2.0, "typescript": 1.8, "node": 1.8, "react": 1.8, "python": 2.0, "django": 1.5, "fastapi": 1.7,
             "docker": 1.6, "kubernetes": 1.6, "github": 1.7, "vscode": 1.6,
-            # IA/ML
             "ai": 1.8, "machine learning": 1.8, "gemini": 1.6, "gpt": 1.6, "openai": 1.8, "llm": 1.8,
         }
 
@@ -485,7 +540,7 @@ class NewsBot:
                         "desc": desc,
                         "link": link,
                         "cat": category,
-                        "_entry": entry,   # guardo entry para imagen
+                        "_entry": entry,
                     }
                     uid = article_uid(a)
                     if uid in self.processed or uid in self.sent_ids:
@@ -512,13 +567,11 @@ class NewsBot:
         return all_articles
 
     def select_top_by_quota(self, articles):
-        """Ordena por importancia y aplica cupos + mínimo 1 de cada categoría disponible."""
         if not articles:
             return []
 
         ranked = self.rank_with_gemini(articles)
 
-        # Cupos
         q = quotas_for_today()
         counts = {k: 0 for k in q}
         selected = []
@@ -530,7 +583,6 @@ class NewsBot:
             if sum(counts.values()) >= sum(q.values()):
                 break
 
-        # Garantías mínimas por categoría
         minimums = {"tecnologia": 1, "medicina": 1, "colombia": 1, "mundial": 1}
         by_cat = {"tecnologia": [], "medicina": [], "colombia": [], "mundial": []}
         for a in ranked:
@@ -548,7 +600,6 @@ class NewsBot:
                     sel_ids.add(uid)
                     break
 
-        # Orden final para presentación
         order = {"tecnologia": 0, "medicina": 1, "colombia": 2, "mundial": 3}
         selected.sort(key=lambda a: order.get(a["cat"], 9))
         logger.info(
@@ -561,7 +612,6 @@ class NewsBot:
         return selected
 
     def run(self):
-        # ---- Encabezado del boletín (texto) ----
         header = f"📰 *{escape_md2('Boletín de noticias')}* — {escape_md2(datetime.now().strftime('%d/%m/%Y %H:%M'))}"
         self.send_text(header)
 
@@ -573,7 +623,6 @@ class NewsBot:
             self.send_text("_No hay noticias nuevas_")
             return
 
-        # Secciones por categoría
         icons  = {"tecnologia": "💻", "colombia": "🇨🇴", "mundial": "🌍", "medicina": "🩺"}
         titles = {"tecnologia": "TECNOLOGÍA", "colombia": "COLOMBIA", "mundial": "MUNDIAL", "medicina": "MEDICINA"}
 
@@ -583,28 +632,21 @@ class NewsBot:
             if not cat_articles:
                 continue
 
-            # Título de categoría
             self.send_text(f"{icons.get(cat,'📰')} *{escape_md2(titles[cat])}*")
 
             for a in cat_articles:
-                # 1) Traducción de título SIEMPRE
                 raw_title = a["title"]
                 title_es  = self.translate_force_es(raw_title)
 
-                # 2) Base: descripción RSS; si es corta, intentamos enriquecer leyendo la página
                 base_text = a["desc"]
                 if len(base_text) < 300:
                     extra = fetch_article_snippet(a["link"])
                     if extra:
                         base_text = (base_text + "\n\n" + extra).strip()
 
-                # 3) Traducimos la base al español (robusto/chunked)
                 base_es = self.translate_force_es(base_text)
+                resumen = self.summarize_extended(title_es, base_es, a["cat"])
 
-                # 4) Resumen extendido (IA si hay cuota; si no, el base_es ya es largo)
-                resumen  = self.summarize_extended(title_es, base_es, a["cat"])
-
-                # 5) Armar caption y enviar con imagen si hay
                 caption = (
                     f"*{escape_md2(title_es)}*\n"
                     f"{escape_md2(resumen)}\n"
@@ -618,16 +660,11 @@ class NewsBot:
                 if not sent_ok:
                     self.send_text(caption)
 
-                # Marcar como enviada
                 self.sent_ids.add(article_uid(a))
 
-        # Footer
         self.send_text(escape_md2("---") + "\n" + "_Resumen automatizado con IA (prioridad tecnología)_")
-
-        # Persistir estado
         save_state(self.sent_ids)
 
-        # Guardar reporte en repo
         reports = pathlib.Path("reports")
         reports.mkdir(exist_ok=True)
         fname = reports / f"boletin_{datetime.now().strftime('%Y-%m-%d_%H%M')}.md"
@@ -636,7 +673,6 @@ class NewsBot:
             logger.info(f"Reporte guardado en: {fname}")
         except Exception as e:
             logger.warning(f"No se pudo guardar el reporte: {e}")
-
         logger.info(f"Boletín enviado. Total noticias: {len(selected)}.")
 
 # ================== MAIN ==================
@@ -649,7 +685,6 @@ def parse_args():
 def main():
     args = parse_args()
     bot = NewsBot(only_tech=args.only_tech, only_medicine=args.only_medicine)
-    # Prueba visible en logs (traducción)
     prueba = bot.translate_force_es("Breaking: Apple unveils a new AI feature for iPhone.")
     logger.info(f"Traducción de prueba: {prueba}")
     logger.info("Generando y enviando boletín...")
