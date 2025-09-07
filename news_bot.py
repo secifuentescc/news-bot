@@ -2,7 +2,6 @@ import os
 import time
 import logging
 import requests
-import schedule
 import feedparser
 from datetime import datetime
 from bs4 import BeautifulSoup
@@ -89,17 +88,12 @@ class NewsBot:
         summary = self.create_summary(all_articles[:9])  # máx 9 noticias
         self.send_message(summary)
 
+# ============== MAIN ==============
 def main():
     bot = NewsBot()
-    schedule.every().day.at("08:00").do(bot.run)
-    schedule.every().day.at("18:00").do(bot.run)
-
-    logger.info("Bot iniciado. Ejecutando prueba inicial...")
+    logger.info("Bot iniciado. Ejecutando una sola vez...")
     bot.run()
-
-    while True:
-        schedule.run_pending()
-        time.sleep(60)
+    logger.info("Bot finalizado.")
 
 if __name__ == "__main__":
     main()
