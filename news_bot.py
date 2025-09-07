@@ -7,6 +7,7 @@ import argparse
 from datetime import datetime
 import pathlib
 import re
+import time
 import requests
 import feedparser
 from bs4 import BeautifulSoup
@@ -23,9 +24,12 @@ TELEGRAM_BOT_TOKEN = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
 TELEGRAM_CHAT_ID   = (os.getenv("TELEGRAM_CHAT_ID") or "").strip()
 GEMINI_KEY         = (os.getenv("GEMINI_API_KEY") or "").strip()
 
+# CONTROL: usar fotos cuando haya imagen en el RSS
+TELEGRAM_USE_PHOTOS = (os.getenv("TELEGRAM_USE_PHOTOS", "true").lower() == "true")
+
 STATE_PATH = pathlib.Path("state_sent.json")
 
-# Fuentes RSS (añadimos MEDICINA, priorizamos tech + salud)
+# Fuentes (incluye MEDICINA)
 NEWS_SOURCES = {
     "mundial": [
         "https://feeds.bbci.co.uk/news/world/rss.xml",
@@ -51,24 +55,19 @@ NEWS_SOURCES = {
         "https://blogs.nvidia.com/feed/",
     ],
     "medicina": [
-        # Journals y editoriales
-        "https://www.nejm.org/rss.xml",                             # NEJM
-        "https://www.thelancet.com/rssfeed/lancet_current.rss",     # The Lancet (current)
-        "https://www.bmj.com/rss/bmj_latest.xml",                   # BMJ
-        "https://www.nature.com/nm.rss",                            # Nature Medicine
-        "https://www.science.org/rss/channel/health",               # Science (Health)
-        # Agencias/organismos (elige los que te funcionen mejor)
-        "https://tools.cdc.gov/api/v2/resources/media/132608.rss",  # CDC Newsroom
-        # Regional
-        "https://www.paho.org/en/rss.xml",                          # OPS/PAHO (EN)
-        "https://www.paho.org/es/rss.xml",                          # OPS/PAHO (ES)
-        # Medios
-        "https://www.statnews.com/feed/",                           # STAT News (global feed)
+        "https://www.nejm.org/rss.xml",
+        "https://www.thelancet.com/rssfeed/lancet_current.rss",
+        "https://www.bmj.com/rss/bmj_latest.xml",
+        "https://www.nature.com/nm.rss",
+        "https://www.science.org/rss/channel/health",
+        "https://tools.cdc.gov/api/v2/resources/media/132608.rss",
+        "https://www.paho.org/en/rss.xml",
+        "https://www.paho.org/es/rss.xml",
+        "https://www.statnews.com/feed/",
     ],
 }
 
 def quotas_for_today():
-    """Cupoes por categoría; fin de semana reducimos tech un poco."""
     is_weekend = datetime.utcnow().weekday() >= 5
     return {
         "tecnologia": (7 if not is_weekend else 5),
@@ -77,7 +76,7 @@ def quotas_for_today():
         "mundial": 3,
     }
 
-# ================== ESCAPES MarkdownV2 (Telegram) ==================
+# ================== ESCAPES MarkdownV2 ==================
 _MD2_SPECIALS = r"_*[]()~`>#+-=|{}.!\\"
 
 def escape_md2(text: str) -> str:
@@ -144,12 +143,10 @@ class NewsBot:
         self.processed = set()
         self.sent_ids = load_state()
 
-        # Gemini opcional
         self.model = None
         if GEMINI_KEY:
             try:
                 genai.configure(api_key=GEMINI_KEY)
-                # 1.5-pro (mejor) o 1.5-flash (más barato/rápido). Cambia si quieres.
                 self.model = genai.GenerativeModel("gemini-1.5-pro")
                 masked = GEMINI_KEY[:4] + "..." + GEMINI_KEY[-4:]
                 logger.info(f"Gemini listo (key {masked}).")
@@ -168,7 +165,7 @@ class NewsBot:
             "chat_id": TELEGRAM_CHAT_ID,
             "text": text,
             "parse_mode": "MarkdownV2",
-            "disable_web_page_preview": False,
+            "disable_web_page_preview": False,  # permitir tarjetas si hay URL "desnuda"
         }
         try:
             r = requests.post(url, data=payload, timeout=25)
@@ -177,13 +174,34 @@ class NewsBot:
         except Exception as e:
             logger.error(f"Error enviando a Telegram: {e}")
 
+    def send_photo(self, photo_url: str, caption_md2: str):
+        """Envía foto con caption en MarkdownV2. Si falla, cae a send_message."""
+        if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+            logger.error("Faltan TELEGRAM_BOT_TOKEN o TELEGRAM_CHAT_ID.")
+            return
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
+        payload = {
+            "chat_id": TELEGRAM_CHAT_ID,
+            "photo": photo_url,
+            "caption": caption_md2[:1024],  # límite prudente para caption
+            "parse_mode": "MarkdownV2",
+        }
+        try:
+            r = requests.post(url, data=payload, timeout=25)
+            if r.ok:
+                return
+            logger.warning(f"sendPhoto falló, usaré texto. Detalle: {r.text}")
+        except Exception as e:
+            logger.warning(f"sendPhoto excepción, usaré texto: {e}")
+        # fallback a texto
+        self.send_message(caption_md2 + "\n" + photo_url)
+
     def send_long(self, text: str):
         for p in chunk(text):
             self.send_message(p)
 
     # ------------ Traducción ------------
     def translate_gemini(self, text: str) -> str | None:
-        """Traduce con Gemini; devuelve None si falla (cuota/timeout)."""
         if not text or not self.model:
             return None
         try:
@@ -200,18 +218,11 @@ class NewsBot:
             return None
 
     def translate_mymemory(self, text: str, assume_en: bool) -> str | None:
-        """
-        Fallback gratuito: MyMemory (límite comunitario).
-        Si assume_en=True usamos langpair=en|es; si no, intentamos auto|es.
-        """
         if not text:
             return None
         try:
             src = "en" if assume_en else "auto"
-            params = {
-                "q": text[:4500],     # límite prudente
-                "langpair": f"{src}|es"
-            }
+            params = {"q": text[:4500], "langpair": f"{src}|es"}
             r = requests.get("https://api.mymemory.translated.net/get", params=params, timeout=12)
             if not r.ok:
                 return None
@@ -225,21 +236,17 @@ class NewsBot:
         return None
 
     def translate_force_es(self, text: str) -> str:
-        """Siempre intenta dejar el texto en español (Gemini -> MyMemory -> original)."""
         if not text:
             return text
-        # 1) Gemini
         out = self.translate_gemini(text)
         if out:
             return out
         logger.info("Gemini sin salida; usaré fallback de traducción.")
-        # 2) Fallback MyMemory (si parece inglés, forzamos en|es)
         out = self.translate_mymemory(text, assume_en=probably_english(text))
         return out or text
 
     # ------------ Resúmenes ------------
     def summarize_extended(self, title_es: str, description_es: str, category: str) -> str:
-        """Resumen 3–5 frases; si no hay IA, devuelve la descripción truncada."""
         base = (description_es or title_es or "").strip()
         if not self.model:
             return base[:600]
@@ -254,15 +261,12 @@ class NewsBot:
             )
             resp = self.model.generate_content(prompt)
             out = (getattr(resp, "text", "") or "").strip()
-            if not out:
-                return base[:600]
-            return out
+            return out or base[:600]
         except Exception as e:
             logger.warning(f"Error resumiendo con Gemini: {e}")
             return base[:600]
 
     def summarize_batch(self, articles):
-        """Boletín completo en una sola llamada (si falla, devolvemos None y usamos fallback por ítem)."""
         if not self.model or not articles:
             return None
         try:
@@ -291,12 +295,8 @@ class NewsBot:
 
     # ------------ Ranking ------------
     def rank_with_gemini(self, articles):
-        """Puntúa importancia (0-10) priorizando tecnología/medicina; fallback heurístico."""
         if not self.model or not articles:
-            return sorted(
-                articles,
-                key=lambda a: (a["cat"] not in ("tecnologia","medicina"),),
-            )
+            return sorted(articles, key=lambda a: (a["cat"] not in ("tecnologia","medicina"),))
         try:
             packed = "\n".join(
                 [f"{i+1}. [{a['cat']}] {a['title']}\n{(a['desc'] or '')[:280]}" for i, a in enumerate(articles)]
@@ -319,10 +319,39 @@ class NewsBot:
             return ranked
         except Exception as e:
             logger.warning(f"No se pudo rankear con IA: {e}")
-            return sorted(
-                articles,
-                key=lambda a: (a["cat"] not in ("tecnologia","medicina"),),
-            )
+            return sorted(articles, key=lambda a: (a["cat"] not in ("tecnologia","medicina"),))
+
+    # ------------ Extraer imagen del RSS ------------
+    def pick_image_from_entry(self, entry) -> str | None:
+        """Intenta obtener una URL de imagen del entry RSS."""
+        # 1) media:content
+        media_content = getattr(entry, "media_content", None)
+        if media_content and isinstance(media_content, list):
+            for m in media_content:
+                url = m.get("url")
+                if url and url.startswith("http"):
+                    return url
+        # 2) media_thumbnail
+        thumbs = getattr(entry, "media_thumbnail", None)
+        if thumbs and isinstance(thumbs, list):
+            for t in thumbs:
+                url = t.get("url")
+                if url and url.startswith("http"):
+                    return url
+        # 3) enclosure
+        for link in entry.get("links", []):
+            if link.get("rel") == "enclosure" and "image" in (link.get("type") or ""):
+                url = link.get("href")
+                if url and url.startswith("http"):
+                    return url
+        # 4) og:image dentro de summary/detail (algunos feeds lo incrustan)
+        raw_desc = entry.get("summary", "") or entry.get("description", "")
+        if raw_desc:
+            soup = BeautifulSoup(raw_desc, "html.parser")
+            img = soup.find("img")
+            if img and img.get("src", "").startswith("http"):
+                return img["src"]
+        return None
 
     # ------------ Datos ------------
     def get_rss(self, category: str):
@@ -337,12 +366,14 @@ class NewsBot:
                     title = entry.get("title") or ""
                     if not link or not title:
                         continue
+                    img = self.pick_image_from_entry(entry)
                     a = {
                         "_i": len(self.processed),
                         "title": title,
                         "desc": desc,
                         "link": link,
-                        "cat": category
+                        "cat": category,
+                        "image": img,
                     }
                     uid = article_uid(a)
                     if uid in self.processed or uid in self.sent_ids:
@@ -368,7 +399,6 @@ class NewsBot:
         return all_articles
 
     def select_top_by_quota(self, articles):
-        """Ordena por importancia y aplica cupos por categoría."""
         if self.only_tech:
             articles = [a for a in articles if a["cat"] == "tecnologia"]
         if self.only_medicine:
@@ -388,19 +418,32 @@ class NewsBot:
             if sum(counts.values()) >= sum(q.values()):
                 break
 
-        # Orden de presentación (tech, medicina, colombia, mundial)
         order = {"tecnologia": 0, "medicina": 1, "colombia": 2, "mundial": 3}
         selected.sort(key=lambda a: order.get(a["cat"], 9))
         logger.info(f"Seleccionadas por cuota: {counts}")
         return selected
 
-    def create_digest_fallback(self, selected):
-        """Fallback por ítem: traduce y resume cada noticia (MarkdownV2)."""
+    def build_caption_for_article(self, a):
+        """Caption corto para foto (máx ~1000 chars). Incluye URL desnuda al final para preview si falla la foto."""
+        title_es = self.translate_force_es(a["title"]) if probably_english(a["title"]) else a["title"]
+        desc_src = a["desc"] if a["desc"] else a["title"]
+        desc_es  = self.translate_force_es(desc_src) if probably_english(desc_src) else desc_src
+        resumen  = self.summarize_extended(title_es, desc_es, a["cat"])
+
+        icons  = {"tecnologia": "💻", "colombia": "🇨🇴", "mundial": "🌍", "medicina": "🩺"}
+        title_bold = f"*{escape_md2(title_es)}*"
+        resumen_md = escape_md2(resumen)
+
+        # IMPORTANTE: URL "desnuda" al final para que Telegram intente generar preview si no hay imagen
+        caption = f"{icons.get(a['cat'],'📰')} {title_bold}\n{resumen_md}\n{a['link']}"
+        return caption
+
+    def create_digest_textblock(self, selected):
+        """Versión solo texto (sin fotos). Incluye URL desnuda por item para preview."""
         if not selected:
             return "*No hay noticias nuevas*"
         icons  = {"tecnologia": "💻", "colombia": "🇨🇴", "mundial": "🌍", "medicina": "🩺"}
         titles = {"tecnologia": "TECNOLOGÍA", "colombia": "COLOMBIA", "mundial": "MUNDIAL", "medicina": "MEDICINA"}
-
         header = f"📰 *{escape_md2('Boletín de noticias')}* — {escape_md2(datetime.now().strftime('%d/%m/%Y %H:%M'))}\n\n"
         text = header
         current_cat = None
@@ -408,62 +451,44 @@ class NewsBot:
             if a["cat"] != current_cat:
                 current_cat = a["cat"]
                 text += f"{icons[current_cat]} *{escape_md2(titles[current_cat])}*\n"
-
-            # Traducción forzada de título/desc (si están en inglés u otro idioma)
             title_es = self.translate_force_es(a["title"]) if probably_english(a["title"]) else a["title"]
             desc_src = a["desc"] if a["desc"] else a["title"]
             desc_es  = self.translate_force_es(desc_src) if probably_english(desc_src) else desc_src
-
-            resumen = self.summarize_extended(title_es, desc_es, a["cat"])
-
-            title_bold = f"*{escape_md2(title_es)}*"
-            resumen_md = escape_md2(resumen)
-
-            # En MarkdownV2, el URL dentro de [texto](url) no requiere escapado especial
-            text += f"• {title_bold}\n{resumen_md}\n[Leer más]({a['link']})\n\n"
-
+            resumen  = self.summarize_extended(title_es, desc_es, a["cat"])
+            text += f"• *{escape_md2(title_es)}*\n{escape_md2(resumen)}\n{a['link']}\n\n"
         text += escape_md2("---") + "\n" + "_Resumen automatizado con IA (prioridad tecnología/medicina)_"
         return text
-
-    def save_report(self, text: str):
-        reports = pathlib.Path("reports")
-        reports.mkdir(exist_ok=True)
-        fname = reports / f"boletin_{datetime.now().strftime('%Y-%m-%d_%H%M')}.md"
-        try:
-            fname.write_text(text, encoding="utf-8")
-            return str(fname)
-        except Exception as e:
-            logger.warning(f"No se pudo guardar el reporte: {e}")
-            return None
 
     def run(self):
         start = datetime.now()
         all_articles = self.collect_all()
-        # filtra artículos ya enviados
         all_articles = [a for a in all_articles if article_uid(a) not in self.sent_ids]
-
         selected = self.select_top_by_quota(all_articles)
 
-        # Intento 1: resumen batch pro (una sola llamada IA)
-        digest = self.summarize_batch(selected)
-        if digest:
-            digest = escape_md2(digest)
+        # Si vamos con fotos, mandamos cada artículo por separado (respetando límites)
+        if TELEGRAM_USE_PHOTOS:
+            for idx, a in enumerate(selected, 1):
+                caption = self.build_caption_for_article(a)
+                if a.get("image"):
+                    self.send_photo(a["image"], caption)
+                else:
+                    # sin imagen → al menos texto con URL desnuda para preview
+                    self.send_message(caption)
+                # pausa corta para no golpear rate-limits
+                time.sleep(0.7)
         else:
-            # Fallback por ítem
-            digest = self.create_digest_fallback(selected)
+            # bloque de texto único (con URL desnuda por item)
+            digest = self.summarize_batch(selected)
+            if digest:
+                digest = escape_md2(digest)
+            else:
+                digest = self.create_digest_textblock(selected)
+            self.send_long(digest)
 
-        # Enviar (en trozos si es largo)
-        self.send_long(digest)
-
-        # Persistir IDs enviados
+        # Persistir IDs
         for a in selected:
             self.sent_ids.add(article_uid(a))
         save_state(self.sent_ids)
-
-        # Guardar reporte en repo
-        saved = self.save_report(digest)
-        if saved:
-            logger.info(f"Reporte guardado en: {saved}")
 
         elapsed = (datetime.now() - start).seconds
         logger.info(f"Boletín enviado. {len(selected)} noticias. Tiempo total: {elapsed}s.")
@@ -478,12 +503,9 @@ def parse_args():
 def main():
     args = parse_args()
     bot = NewsBot(only_tech=args.only_tech, only_medicine=args.only_medicine)
-
-    # Prueba visible en logs (debe salir traducido si la key/quotas están OK o usar fallback)
     sample = "Breaking: Apple unveils a new AI feature for iPhone."
     test = bot.translate_force_es(sample)
     logger.info(f"Traducción de prueba: {test}")
-
     logger.info("Generando y enviando boletín...")
     bot.run()
     logger.info("Listo.")
