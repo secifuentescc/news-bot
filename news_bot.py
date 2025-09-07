@@ -22,6 +22,8 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 GEMINI_KEY = (os.getenv("GEMINI_API_KEY") or "").strip()
 
+REQUESTS_TIMEOUT = 25  # segundos
+
 # Fuentes RSS
 NEWS_SOURCES = {
     "mundial": [
@@ -105,6 +107,26 @@ def save_state(sent_ids: set):
     except Exception as e:
         logger.warning(f"No se pudo guardar el estado: {e}")
 
+# ================== FALLBACK DE TRADUCCIÓN (LibreTranslate) ==================
+def libretranslate(text: str, target="es") -> str:
+    """
+    Fallback gratuito. Puedes cambiar la URL por otra instancia si esta se satura.
+    """
+    if not text:
+        return text
+    url = os.getenv("LIBRETRANSLATE_URL", "https://libretranslate.com/translate")
+    data = {"q": text, "source": "auto", "target": target, "format": "text"}
+    try:
+        r = requests.post(url, data=data, timeout=10)
+        if r.ok:
+            out = r.json().get("translatedText", "") or ""
+            if out.strip():
+                logger.info("Traducción vía LibreTranslate usada.")
+                return out.strip()
+    except Exception as e:
+        logger.warning(f"Fallback LibreTranslate falló: {e}")
+    return text
+
 # ================== BOT ==================
 class NewsBot:
     def __init__(self, only_tech: bool = False):
@@ -112,18 +134,60 @@ class NewsBot:
         self.processed = set()
         self.sent_ids = load_state()
 
-        # Inicializa Gemini (modelo PRO)
+        # Inicializa Gemini con extracción robusta
         self.model = None
         if GEMINI_KEY:
             try:
                 genai.configure(api_key=GEMINI_KEY)
-                self.model = genai.GenerativeModel("gemini-1.5-pro")
+                # Intenta pro-latest; si falla, cae a pro
+                try:
+                    self.model = genai.GenerativeModel("gemini-1.5-pro-latest")
+                except Exception:
+                    self.model = genai.GenerativeModel("gemini-1.5-pro")
                 masked = GEMINI_KEY[:4] + "..." + GEMINI_KEY[-4:]
                 logger.info(f"Gemini listo (key {masked}).")
             except Exception as e:
                 logger.warning(f"No se pudo inicializar Gemini: {e}")
         else:
             logger.warning("GEMINI_API_KEY no definido: no habrá traducción ni resúmenes IA.")
+
+    # ------------ Gemini helper ------------
+    @staticmethod
+    def _extract_text(resp) -> str:
+        """
+        Extrae texto de la respuesta de google-generativeai de forma robusta.
+        """
+        try:
+            if hasattr(resp, "text") and resp.text:
+                return resp.text
+            if hasattr(resp, "candidates") and resp.candidates:
+                cand = resp.candidates[0]
+                if hasattr(cand, "content") and hasattr(cand.content, "parts"):
+                    parts = cand.content.parts
+                    texts = []
+                    for p in parts:
+                        # parts pueden tener .text o dict-like
+                        t = getattr(p, "text", None)
+                        if t:
+                            texts.append(t)
+                        elif isinstance(p, dict) and "text" in p:
+                            texts.append(p["text"])
+                    if texts:
+                        return "".join(texts)
+        except Exception as e:
+            logger.debug(f"No se pudo extraer texto de Gemini: {e}")
+        return ""
+
+    def gemini_generate(self, prompt: str) -> str:
+        if not self.model:
+            return ""
+        try:
+            resp = self.model.generate_content(prompt)
+            out = self._extract_text(resp).strip()
+            return out
+        except Exception as e:
+            logger.warning(f"Gemini generate_content falló: {e}")
+            return ""
 
     # ------------ Transporte ------------
     def send_message(self, text: str):
@@ -139,7 +203,7 @@ class NewsBot:
             "disable_web_page_preview": False,
         }
         try:
-            r = requests.post(url, data=payload, timeout=25)
+            r = requests.post(url, data=payload, timeout=REQUESTS_TIMEOUT)
             if not r.ok:
                 logger.error(f"Telegram error: {r.text}")
         except Exception as e:
@@ -161,34 +225,35 @@ class NewsBot:
         for p in chunk(text):
             self.send_message(p)
 
-    # ------------ IA helpers ------------
+    # ------------ IA helpers (forzar español) ------------
     def translate_force_es(self, text: str) -> str:
-        """Siempre reescribe el texto en español con Gemini."""
+        """Siempre reescribe en español. Usa Gemini y cae a LibreTranslate si hay fallo/silencio."""
         if not text:
             return text
-        if not self.model:
-            logger.warning("Gemini no inicializado: envío sin traducir.")
-            return text
-        prompt = (
-            "Reescribe este texto ÍNTEGRAMENTE en ESPAÑOL neutro, claro y natural. "
-            "Si ya está en español, simplemente reescríbelo mejorado. "
-            "No dejes nada en inglés. No agregues comillas ni comentarios.\n\n"
-            f"{text}"
-        )
-        try:
-            resp = self.model.generate_content(prompt)
-            out = (getattr(resp, "text", "") or "").strip()
-            return out or text
-        except Exception as e:
-            logger.error(f"Error traduciendo: {e}")
-            return text
+        # 1) Gemini
+        if self.model:
+            prompt = (
+                "Reescribe este texto ÍNTEGRAMENTE en ESPAÑOL neutro, claro y natural. "
+                "Si ya está en español, simplemente reescríbelo mejorado. "
+                "No dejes nada en inglés. No agregues comillas ni comentarios.\n\n"
+                f"{text}"
+            )
+            out = self.gemini_generate(prompt)
+            if out:
+                return out
+            logger.info("Gemini no devolvió texto; intento fallback a LibreTranslate.")
+        else:
+            logger.warning("Gemini no inicializado: usando fallback de traducción.")
+        # 2) Fallback LibreTranslate
+        return libretranslate(text, target="es")
 
     def summarize_extended(self, title_es: str, description_es: str, category: str) -> str:
-        """Resumen 3–5 frases siempre en español."""
+        """Resumen 3–5 frases SIEMPRE en español. Usa Gemini y cae a LibreTranslate si es necesario."""
         base = (description_es or title_es or "").strip()
-        if not self.model:
-            return base[:600]
-        try:
+        if not base:
+            base = title_es or ""
+        # 1) Gemini
+        if self.model:
             prompt = (
                 "Redacta un resumen informativo en ESPAÑOL (3 a 5 frases, "
                 "máximo ~100 palabras) sobre la noticia. Explica qué pasó, "
@@ -198,21 +263,19 @@ class NewsBot:
                 f"Descripción: {description_es}\n"
                 f"Categoría: {category.upper()}\n"
             )
-            resp = self.model.generate_content(prompt)
-            out = (getattr(resp, "text", "") or "").strip()
-            return out or base[:600]
-        except Exception as e:
-            logger.error(f"Error resumiendo: {e}")
-            return base[:600]
+            out = self.gemini_generate(prompt)
+            if out:
+                return out
+            logger.info("Gemini no devolvió texto en resumen; usaré fallback.")
+        # 2) Fallback simple: si base parece inglés, intenta traducirlo
+        return libretranslate(base, target="es")[:600]
 
     def rank_with_gemini(self, articles):
         """Ranking básico: prioridad a tecnología si falla IA."""
         if not self.model or not articles:
             return sorted(articles, key=lambda a: (a["cat"] != "tecnologia",))
         try:
-            packed = "\n".join(
-                [f"{i+1}. [{a['cat']}] {a['title']}" for i, a in enumerate(articles)]
-            )
+            packed = "\n".join([f"{i+1}. [{a['cat']}] {a['title']}" for i, a in enumerate(articles)])
             prompt = (
                 "Eres editor. Puntúa cada noticia del 1 al 10 según impacto, "
                 "novedad y relevancia para lectores hispanohablantes. "
@@ -220,9 +283,10 @@ class NewsBot:
                 "Devuelve JSON: [{\"idx\": <n>, \"score\": <0-10>}].\n\n"
                 f"NOTICIAS:\n{packed}"
             )
-            resp = self.model.generate_content(prompt)
-            txt = (getattr(resp, "text", "") or "").strip()
-            scores = json.loads(txt)
+            out = self.gemini_generate(prompt)
+            if not out:
+                raise ValueError("Respuesta vacía del ranker.")
+            scores = json.loads(out)
             score_map = {int(it["idx"]) - 1: float(it["score"]) for it in scores if "idx" in it and "score" in it}
             ranked = sorted(
                 articles,
