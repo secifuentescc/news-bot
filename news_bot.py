@@ -27,6 +27,7 @@ STATE_PATH = pathlib.Path("state_sent.json")
 # Fuentes RSS (incluye Colombia, Tech, Mundial y Medicina)
 NEWS_SOURCES = {
     "tecnologia": [
+        # Core tech
         "https://techcrunch.com/feed/",
         "https://www.theverge.com/rss/index.xml",
         "https://arstechnica.com/feed/",
@@ -35,10 +36,26 @@ NEWS_SOURCES = {
         "https://spectrum.ieee.org/rss/fulltext",
         "https://www.technologyreview.com/feed/",
         "https://www.engadget.com/rss.xml",
-        # Blogs core IA/Cloud
+        # IA/Cloud
         "https://ai.googleblog.com/feeds/posts/default",
         "https://openai.com/blog/rss.xml",
         "https://blogs.nvidia.com/feed/",
+        # Apple / iOS
+        "https://www.apple.com/newsroom/rss-feed.rss",
+        "https://developer.apple.com/news/releases/rss.xml",
+        "https://9to5mac.com/feed/",
+        "https://www.macrumors.com/macrumors.xml",
+        "https://appleinsider.com/rss",
+        "https://iosdevweekly.com/issues.rss",
+        # Android / Dev general
+        "https://android-developers.googleblog.com/atom.xml",
+        "https://github.blog/changelog/feed/",
+        "https://news.ycombinator.com/rss",
+        "http://export.arxiv.org/rss/cs.AI",
+        # Tech en español
+        "https://www.xataka.com/tag/feeds/rss2.xml",
+        "https://www.hipertextual.com/feed",
+        "https://www.genbeta.com/feed",
     ],
     "colombia": [
         "https://www.eltiempo.com/rss.xml",
@@ -60,30 +77,17 @@ NEWS_SOURCES = {
         "https://jamanetwork.com/rss/site_6/mostRecent.xml",
         "https://www.nature.com/subjects/medicine.rss",
         "https://www.medscape.com/rss/all",
+        # extra fuertes
+        "https://www.nih.gov/news-events/news-releases.xml",
+        "https://www.who.int/rss-feeds/news-english.xml",
+        "https://www.medrxiv.org/rss/latest.xml",
+        "https://www.fda.gov/about-fda/newsroom/press-announcements/rss.xml",
     ],
 }
 
-# --- (1) Agregamos fuentes nuevas sin borrar las existentes ---
-NEWS_SOURCES["tecnologia"] += [
-    "https://www.apple.com/newsroom/rss-feed.rss",            # Apple Newsroom
-    "https://developer.apple.com/news/releases/rss.xml",      # Apple Developer releases
-    "https://iosdevweekly.com/issues.rss",                    # iOS Dev Weekly
-    "https://android-developers.googleblog.com/atom.xml",     # Android Developers Blog
-    "https://news.ycombinator.com/rss",                       # Hacker News
-    "http://export.arxiv.org/rss/cs.AI",                      # arXiv AI
-    "https://github.blog/changelog/feed/",                    # GitHub Changelog
-]
-
-NEWS_SOURCES["medicina"] += [
-    "https://www.fda.gov/about-fda/newsroom/press-announcements/rss.xml",  # FDA PR
-    "https://www.nih.gov/news-events/news-releases.xml",                   # NIH
-    "https://www.who.int/rss-feeds/news-english.xml",                      # WHO (inglés)
-    "https://www.medrxiv.org/rss/latest.xml",                              # medRxiv preprints
-]
-
 def quotas_for_today():
     # Cupos por categoría (ajustables). Garantizamos mínimo 1 más abajo.
-    return {"tecnologia": 6, "medicina": 3, "colombia": 2, "mundial": 2}
+    return {"tecnologia": 8, "medicina": 4, "colombia": 3, "mundial": 3}
 
 # ================== MARKDOWNV2 ESCAPES ==================
 def escape_md2(text: str) -> str:
@@ -132,12 +136,6 @@ def save_state(sent_ids: set):
 
 # ================== EXTRACCIÓN DE IMAGEN ==================
 def get_image_for_entry(entry: dict, fallback_link: str) -> str | None:
-    """
-    Intenta hallar una imagen del RSS:
-    - media:content / media:thumbnail
-    - enclosure url con tipo imagen
-    - primer <img> en summary/detail
-    """
     media_content = entry.get("media_content") or entry.get("media:content")
     if isinstance(media_content, list) and media_content:
         url = media_content[0].get("url")
@@ -178,6 +176,36 @@ def get_image_for_entry(entry: dict, fallback_link: str) -> str | None:
                 return img.get("src")
 
     return None
+
+# ================== ENRIQUECIMIENTO DE TEXTO (sin IA) ==================
+def fetch_article_snippet(url: str, min_len: int = 300, max_len: int = 900) -> str | None:
+    """
+    Si la descripción RSS es muy corta, intentamos obtener 1 párrafo bueno del HTML:
+    - Descargamos con timeout corto
+    - Tomamos el <p> más largo (visible) dentro de límites
+    """
+    try:
+        r = requests.get(url, timeout=6, headers={"User-Agent": "Mozilla/5.0"})
+        if not r.ok or not r.text:
+            return None
+        soup = BeautifulSoup(r.text, "html.parser")
+        candidates = []
+        for p in soup.find_all("p"):
+            txt = p.get_text(" ", strip=True)
+            if not txt:
+                continue
+            # quitar cosas obvias
+            if "cookie" in txt.lower() or "suscríbete" in txt.lower() or "subscribe" in txt.lower():
+                continue
+            if len(txt) >= min_len:
+                candidates.append(txt[:max_len])
+        if not candidates:
+            return None
+        # el más largo dentro del rango
+        best = sorted(candidates, key=len, reverse=True)[0]
+        return best
+    except Exception:
+        return None
 
 # ================== BOT ==================
 class NewsBot:
@@ -246,7 +274,7 @@ class NewsBot:
 
     # ------------ Traducción / Resumen ------------
     def translate_force_es(self, text: str) -> str:
-        """Fuerza traducción al español. Gemini primero; si falla, MyMemory; si falla, original."""
+        """Fuerza traducción al español. Gemini → MyMemory → original."""
         if not text:
             return text
 
@@ -284,45 +312,66 @@ class NewsBot:
         # 3) Último recurso: original
         return text
 
-    def summarize_extended(self, title_es: str, description_es: str, category: str) -> str:
+    def summarize_extended(self, title_es: str, base_es: str, category: str) -> str:
         """
-        Resumen extendido (~90–130 palabras) con:
-        - Qué pasó (quién/qué/cuándo/dónde)
-        - Contexto/antecedentes
-        - Por qué importa (impacto)
-        - Qué viene después
-        Fallback: trozo de la descripción.
+        Resumen extendido (~120–160 palabras). Con IA si hay cuota, si no:
+        - usamos base_es o extraído de la página para enriquecer.
         """
-        base = (description_es or title_es or "").strip()
-        if not self.model:
-            # Sin IA: devolvemos descripción un poco más larga, limitada para caption.
-            return base[:700]
+        # Intento IA
+        if self.model:
+            try:
+                prompt = (
+                    "Escribe un resumen extendido en español, claro y profesional, de ~120–160 palabras. "
+                    "Incluye: qué pasó (quién/qué/cuándo/dónde), contexto breve, por qué importa (impacto) "
+                    "y qué viene después. Evita opiniones, emojis y listas; un solo párrafo fluido. "
+                    "No repitas el título.\n\n"
+                    f"CATEGORÍA: {category.upper()}\n"
+                    f"TÍTULO: {title_es}\n"
+                    f"TEXTO/EXTRACTO:\n{base_es}\n"
+                )
+                resp = self.model.generate_content(prompt)
+                out = (getattr(resp, "text", "") or "").strip()
+                if out:
+                    if len(out) > 900:
+                        out = out[:900]
+                    return out
+            except Exception as e:
+                logger.warning(f"Gemini resumen extendido falló: {e}")
 
-        try:
-            prompt = (
-                "Escribe un resumen extendido en español, claro y profesional, de ~100–130 palabras. "
-                "Incluye: qué pasó (quién/qué/cuándo/dónde), contexto breve, por qué importa (impacto) "
-                "y qué viene después. Evita opiniones, emojis y listas; un solo párrafo fluido. "
-                "No repitas el título.\n\n"
-                f"CATEGORÍA: {category.upper()}\n"
-                f"TÍTULO: {title_es}\n"
-                f"TEXTO/EXTRACTO:\n{description_es}\n"
-            )
-            resp = self.model.generate_content(prompt)
-            out = (getattr(resp, "text", "") or "").strip()
-            # Seguridad de longitud para caption de foto (dejamos margen)
-            if len(out) > 700:
-                out = out[:700]
-            return out or base[:700]
-        except Exception as e:
-            logger.warning(f"Gemini resumen extendido falló: {e}")
-            return base[:700]
+        # Sin IA o falló: usamos el texto enriquecido
+        return base_es[:900]
 
     def rank_with_gemini(self, articles):
-        """Puntúa importancia (0-10) priorizando tecnología; fallback heurístico simple."""
+        """
+        Ranking con IA si hay, y además reforzamos prioridades manuales:
+        - Peso extra fuerte: Apple/iOS/Swift, JavaScript, Python, AI/ML, DevTools, GitHub.
+        """
+        # Boost manual por keywords (insensible a mayúsculas)
+        KW_BOOST = {
+            # Apple / iOS
+            "apple": 2.2, "ios": 2.2, "iphone": 1.8, "ipad": 1.6, "mac": 1.4, "swift": 2.0, "xcode": 1.9, "wwdc": 2.2,
+            # Dev
+            "javascript": 2.0, "typescript": 1.8, "node": 1.8, "react": 1.8, "python": 2.0, "django": 1.5, "fastapi": 1.7,
+            "docker": 1.6, "kubernetes": 1.6, "github": 1.7, "vscode": 1.6,
+            # IA/ML
+            "ai": 1.8, "machine learning": 1.8, "gemini": 1.6, "gpt": 1.6, "openai": 1.8, "llm": 1.8,
+        }
+
+        def manual_score(a):
+            base = 1.0
+            text = f"{a['title']} {a['desc']}".lower()
+            for k, w in KW_BOOST.items():
+                if k in text:
+                    base += w
+            # tecnología parte arriba por defecto
+            if a["cat"] == "tecnologia":
+                base += 0.8
+            return base
+
         if not self.model or not articles:
-            # Heurística mínima: tecnología primero
-            return sorted(articles, key=lambda a: (a["cat"] != "tecnologia",))
+            return sorted(articles, key=manual_score, reverse=True)
+
+        # Con IA: mezclamos score IA + boost manual
         try:
             packed = "\n".join(
                 [f"{i+1}. [{a['cat']}] {a['title']}\n{(a['desc'] or '')[:280]}" for i, a in enumerate(articles)]
@@ -339,13 +388,13 @@ class NewsBot:
             score_map = {int(it["idx"]) - 1: float(it["score"]) for it in scores if "idx" in it and "score" in it}
             ranked = sorted(
                 articles,
-                key=lambda a: score_map.get(a["_i"], 0.0) + (1.0 if a["cat"] == "tecnologia" else 0.0),
+                key=lambda a: score_map.get(a["_i"], 0.0) + manual_score(a),
                 reverse=True,
             )
             return ranked
         except Exception as e:
             logger.warning(f"No se pudo rankear con IA: {e}")
-            return sorted(articles, key=lambda a: (a["cat"] != "tecnologia",))
+            return sorted(articles, key=manual_score, reverse=True)
 
     # ------------ Datos ------------
     def get_rss(self, category: str):
@@ -468,13 +517,24 @@ class NewsBot:
             self.send_text(f"{icons.get(cat,'📰')} *{escape_md2(titles[cat])}*")
 
             for a in cat_articles:
-                # Traducimos título SIEMPRE antes de escapar
+                # 1) Traducción de título SIEMPRE
                 raw_title = a["title"]
                 title_es  = self.translate_force_es(raw_title)
 
-                desc_src = a["desc"] if a["desc"] else raw_title
-                resumen  = self.summarize_extended(title_es, self.translate_force_es(desc_src), a["cat"])
+                # 2) Base: descripción RSS; si es corta, intentamos enriquecer leyendo la página
+                base_text = a["desc"]
+                if len(base_text) < 300:
+                    extra = fetch_article_snippet(a["link"])
+                    if extra:
+                        base_text = (base_text + "\n\n" + extra).strip()
 
+                # 3) Traducimos la base al español
+                base_es = self.translate_force_es(base_text)
+
+                # 4) Resumen extendido (IA si hay cuota; si no, el base_es ya es largo)
+                resumen  = self.summarize_extended(title_es, base_es, a["cat"])
+
+                # 5) Armar caption y enviar con imagen si hay
                 caption = (
                     f"*{escape_md2(title_es)}*\n"
                     f"{escape_md2(resumen)}\n"
