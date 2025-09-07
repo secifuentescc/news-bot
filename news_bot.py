@@ -25,10 +25,8 @@ GEMINI_KEY         = os.getenv("GEMINI_API_KEY", "").strip()
 
 STATE_PATH = pathlib.Path("state_sent.json")
 
-# Fuentes RSS (incluye Colombia, Tech, Mundial y Medicina)
 NEWS_SOURCES = {
     "tecnologia": [
-        # Core tech
         "https://techcrunch.com/feed/",
         "https://www.theverge.com/rss/index.xml",
         "https://arstechnica.com/feed/",
@@ -37,7 +35,6 @@ NEWS_SOURCES = {
         "https://spectrum.ieee.org/rss/fulltext",
         "https://www.technologyreview.com/feed/",
         "https://www.engadget.com/rss.xml",
-        # IA/Cloud
         "https://ai.googleblog.com/feeds/posts/default",
         "https://openai.com/blog/rss.xml",
         "https://blogs.nvidia.com/feed/",
@@ -48,7 +45,7 @@ NEWS_SOURCES = {
         "https://www.macrumors.com/macrumors.xml",
         "https://appleinsider.com/rss",
         "https://iosdevweekly.com/issues.rss",
-        # Android / Dev general
+        # Android / Dev
         "https://android-developers.googleblog.com/atom.xml",
         "https://github.blog/changelog/feed/",
         "https://news.ycombinator.com/rss",
@@ -172,7 +169,6 @@ def get_image_for_entry(entry: dict, fallback_link: str) -> str | None:
             img = soup.find("img")
             if img and img.get("src"):
                 return img.get("src")
-
     return None
 
 # ================== ENRIQUECIMIENTO DE TEXTO (sin IA) ==================
@@ -198,7 +194,7 @@ def fetch_article_snippet(url: str, min_len: int = 300, max_len: int = 900) -> s
     except Exception:
         return None
 
-# ================== TRADUCCIÓN ROBUSTA ==================
+# ================== TRADUCCIÓN (OFFLINE PRIMERO) ==================
 def _chunk_text_for_mymemory(text: str, max_len: int = 480):
     if not text:
         return []
@@ -220,22 +216,18 @@ def _chunk_text_for_mymemory(text: str, max_len: int = 480):
                 chunks.append(" ".join(buf).strip())
             if len(s) > max_len:
                 words = s.split()
-                cur = []
-                cur_len = 0
+                cur, cur_len = [], 0
                 for w in words:
                     if cur_len + len(w) + 1 <= max_len:
-                        cur.append(w)
-                        cur_len += len(w) + 1
+                        cur.append(w); cur_len += len(w) + 1
                     else:
                         chunks.append(" ".join(cur).strip())
-                        cur = [w]
-                        cur_len = len(w)
+                        cur, cur_len = [w], len(w)
                 if cur:
                     chunks.append(" ".join(cur).strip())
                 buf, count = [], 0
             else:
-                buf = [s]
-                count = len(s)
+                buf, count = [s], len(s)
     if buf:
         chunks.append(" ".join(buf).strip())
     return chunks
@@ -250,40 +242,54 @@ def _looks_spanish(text: str) -> bool:
     accents = any(c in low for c in "áéíóúñ")
     return hits >= 3 or accents
 
-# ===== Argos Translate (offline) =====
 _ARGOS_READY = False
-def ensure_argos_en_es():
+
+def ensure_argos_en_es(wait: bool = True, max_wait_s: int = 90) -> bool:
     """
-    Garantiza que el paquete EN->ES de Argos esté instalado.
-    Descarga el modelo la primera vez (requiere internet).
+    Garantiza que Argos EN->ES está instalado.
+    Si wait=True, espera hasta max_wait_s intentando descargar/instalar.
     """
     global _ARGOS_READY
     if _ARGOS_READY:
         return True
     try:
         import argostranslate.package, argostranslate.translate  # noqa
-        # ¿Ya hay traducción en->es?
-        installed = argostranslate.translate.get_installed_languages()
-        en = next((l for l in installed if l.code.startswith("en")), None)
-        es = next((l for l in installed if l.code.startswith("es")), None)
-        if en and es:
-            paths = [t for t in en.translations if t.to_language.code.startswith("es")]
-            if paths:
-                _ARGOS_READY = True
-                return True
+        start = time.time()
 
-        # Instalar paquete EN->ES
+        def has_en_es():
+            import argostranslate.translate as t
+            installed = t.get_installed_languages()
+            en = next((l for l in installed if l.code.startswith("en")), None)
+            es = next((l for l in installed if l.code.startswith("es")), None)
+            if not en or not es:
+                return False
+            trans = next((tr for tr in en.translations if tr.to_language.code.startswith("es")), None)
+            return trans is not None
+
+        if has_en_es():
+            _ARGOS_READY = True
+            return True
+
+        # Descarga/instala
         argostranslate.package.update_package_index()
         available = argostranslate.package.get_available_packages()
         pkg = next((p for p in available if p.from_code.startswith("en") and p.to_code.startswith("es")), None)
         if not pkg:
-            logger.warning("No encontré paquete Argos EN->ES en el índice.")
+            logger.warning("No se encontró paquete Argos EN->ES.")
             return False
         dl_path = pkg.download()
         argostranslate.package.install_from_path(dl_path)
-        _ARGOS_READY = True
-        logger.info("Modelo Argos EN->ES instalado.")
-        return True
+
+        if wait:
+            while not has_en_es() and time.time() - start < max_wait_s:
+                time.sleep(1)
+
+        _ARGOS_READY = has_en_es()
+        if _ARGOS_READY:
+            logger.info("Argos EN->ES listo (offline).")
+        else:
+            logger.warning("Argos EN->ES no quedó listo dentro del tiempo.")
+        return _ARGOS_READY
     except Exception as e:
         logger.warning(f"Argos no disponible: {e}")
         return False
@@ -299,6 +305,8 @@ def argos_translate_en_es(text: str) -> str | None:
         translator = next((t for t in en.translations if t.to_language.code.startswith("es")), None)
         if not translator:
             return None
+        # Argos no maneja textos gigantes bien; recortamos a 3000 por seguridad
+        text = text[:3000]
         return translator.translate(text)
     except Exception:
         return None
@@ -310,9 +318,9 @@ class NewsBot:
         self.only_medicine = only_medicine
         self.processed = set()
         self.sent_ids = load_state()
-        self.tcache = {}  # caché simple de traducción
+        self.tcache = {}
 
-        # Inicializa Gemini (opcional)
+        # Gemini solo para RESUMEN/RANK (no para traducir)
         self.model = None
         if GEMINI_KEY:
             try:
@@ -323,10 +331,13 @@ class NewsBot:
             except Exception as e:
                 logger.warning(f"No se pudo inicializar Gemini: {e}")
         else:
-            logger.warning("GEMINI_API_KEY no definido: no habrá traducción/resumen IA.")
+            logger.warning("GEMINI_API_KEY no definido: no habrá resumen IA.")
 
-        # Prepara Argos offline (no es obligatorio, pero lo intentamos)
-        ensure_argos_en_es()
+        # Prepara Argos (bloqueante la primera vez)
+        if ensure_argos_en_es(wait=True, max_wait_s=120):
+            logger.info("Traductor offline habilitado.")
+        else:
+            logger.warning("Seguiré sin Argos; usaré MyMemory con troceo y pausas.")
 
     # ------------ Transporte ------------
     def send_text(self, text: str):
@@ -372,57 +383,30 @@ class NewsBot:
         for p in chunk(text):
             self.send_text(p)
 
-    # ------------ Traducción / Resumen ------------
+    # ------------ Traducción (OFFLINE→ONLINE) ------------
     def translate_force_es(self, text: str) -> str:
-        """
-        Orden de traducción muy estable:
-        0) Cache
-        1) Si parece español, devolver tal cual.
-        2) Gemini (si disponible).
-        3) Argos Translate (offline EN->ES).
-        4) MyMemory (chunked, con pequeño delay para evitar rate-limit).
-        5) Original.
-        """
         if not text:
             return text
 
-        # Cache
-        key = ("en-es", text[:1000])  # clave simple (máx 1000 chars para no crecer mucho)
+        # Cache por fragmento (hasta 1200 chars para limitar la clave)
+        key = ("en-es", text[:1200])
         if key in self.tcache:
             return self.tcache[key]
 
+        # Si parece español, devolver tal cual
         if _looks_spanish(text):
             self.tcache[key] = text
             return text
 
-        # 1) Gemini
-        if self.model:
-            try:
-                prompt = (
-                    "Traduce al español de forma natural y clara. "
-                    "No agregues comentarios ni comillas. Solo el texto traducido.\n\n"
-                    f"{text}"
-                )
-                resp = self.model.generate_content(prompt)
-                out = (getattr(resp, "text", "") or "").strip()
-                if out:
-                    self.tcache[key] = out
-                    return out
-            except Exception as e:
-                logger.warning(f"Gemini traducción falló: {e}")
+        # 1) Argos offline primero
+        if ensure_argos_en_es(wait=False):
+            out = argos_translate_en_es(text)
+            if out:
+                logger.info("Traducción vía Argos (offline).")
+                self.tcache[key] = out
+                return out
 
-        # 2) Argos offline
-        try:
-            if ensure_argos_en_es():
-                out = argos_translate_en_es(text)
-                if out:
-                    logger.info("Traducción vía Argos (offline) OK.")
-                    self.tcache[key] = out
-                    return out
-        except Exception as e:
-            logger.warning(f"Argos falló: {e}")
-
-        # 3) MyMemory (chunked + delay leve)
+        # 2) MyMemory (troceado + pausas) como red de seguridad
         try:
             parts = _chunk_text_for_mymemory(text, max_len=480)
             translated_parts = []
@@ -439,21 +423,21 @@ class NewsBot:
                 else:
                     frag = p
                 translated_parts.append(frag)
-                # Pausa pequeña para evitar "max queries/min"
                 if i < len(parts) - 1:
                     time.sleep(0.5)
             out = " ".join(translated_parts).strip()
             if out:
-                logger.info("Traducción vía MyMemory OK (chunked).")
+                logger.info("Traducción vía MyMemory (chunked).")
                 self.tcache[key] = out
                 return out
         except Exception as e:
-            logger.warning(f"MyMemory (chunked) falló: {e}")
+            logger.warning(f"MyMemory falló: {e}")
 
-        # 4) Original
+        # 3) Último recurso
         self.tcache[key] = text
         return text
 
+    # ------------ Resumen / Ranking ------------
     def summarize_extended(self, title_es: str, base_es: str, category: str) -> str:
         if self.model:
             try:
@@ -534,19 +518,11 @@ class NewsBot:
                     title = entry.get("title") or ""
                     if not link or not title:
                         continue
-                    a = {
-                        "_i": len(self.processed),
-                        "title": title,
-                        "desc": desc,
-                        "link": link,
-                        "cat": category,
-                        "_entry": entry,
-                    }
+                    a = {"_i": len(self.processed), "title": title, "desc": desc, "link": link, "cat": category, "_entry": entry}
                     uid = article_uid(a)
                     if uid in self.processed or uid in self.sent_ids:
                         continue
-                    arts.append(a)
-                    self.processed.add(uid)
+                    arts.append(a); self.processed.add(uid)
             except Exception as e:
                 logger.error(f"Error con RSS {rss}: {e}")
         return arts
@@ -569,17 +545,13 @@ class NewsBot:
     def select_top_by_quota(self, articles):
         if not articles:
             return []
-
         ranked = self.rank_with_gemini(articles)
-
         q = quotas_for_today()
         counts = {k: 0 for k in q}
         selected = []
-
         for a in ranked:
             if counts.get(a["cat"], 0) < q.get(a["cat"], 0):
-                selected.append(a)
-                counts[a["cat"]] += 1
+                selected.append(a); counts[a["cat"]] += 1
             if sum(counts.values()) >= sum(q.values()):
                 break
 
@@ -596,9 +568,7 @@ class NewsBot:
             for cand in by_cat.get(cat, []):
                 uid = article_uid(cand)
                 if uid not in sel_ids:
-                    selected.append(cand)
-                    sel_ids.add(uid)
-                    break
+                    selected.append(cand); sel_ids.add(uid); break
 
         order = {"tecnologia": 0, "medicina": 1, "colombia": 2, "mundial": 3}
         selected.sort(key=lambda a: order.get(a["cat"], 9))
@@ -612,6 +582,7 @@ class NewsBot:
         return selected
 
     def run(self):
+        # Encabezado
         header = f"📰 *{escape_md2('Boletín de noticias')}* — {escape_md2(datetime.now().strftime('%d/%m/%Y %H:%M'))}"
         self.send_text(header)
 
@@ -635,8 +606,7 @@ class NewsBot:
             self.send_text(f"{icons.get(cat,'📰')} *{escape_md2(titles[cat])}*")
 
             for a in cat_articles:
-                raw_title = a["title"]
-                title_es  = self.translate_force_es(raw_title)
+                title_es  = self.translate_force_es(a["title"])
 
                 base_text = a["desc"]
                 if len(base_text) < 300:
@@ -647,16 +617,10 @@ class NewsBot:
                 base_es = self.translate_force_es(base_text)
                 resumen = self.summarize_extended(title_es, base_es, a["cat"])
 
-                caption = (
-                    f"*{escape_md2(title_es)}*\n"
-                    f"{escape_md2(resumen)}\n"
-                    f"{escape_md2_url(a['link'])}"
-                )
+                caption = f"*{escape_md2(title_es)}*\n{escape_md2(resumen)}\n{escape_md2_url(a['link'])}"
 
                 img_url = get_image_for_entry(a.get("_entry", {}), a["link"])
-                sent_ok = False
-                if img_url:
-                    sent_ok = self.send_photo(img_url, caption)
+                sent_ok = self.send_photo(img_url, caption) if img_url else False
                 if not sent_ok:
                     self.send_text(caption)
 
@@ -685,6 +649,7 @@ def parse_args():
 def main():
     args = parse_args()
     bot = NewsBot(only_tech=args.only_tech, only_medicine=args.only_medicine)
+    # Log de prueba (debe salir SIEMPRE en español, offline si hace falta)
     prueba = bot.translate_force_es("Breaking: Apple unveils a new AI feature for iPhone.")
     logger.info(f"Traducción de prueba: {prueba}")
     logger.info("Generando y enviando boletín...")
