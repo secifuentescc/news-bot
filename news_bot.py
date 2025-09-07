@@ -1,8 +1,13 @@
 import os
+import sys
+import json
+import hashlib
 import logging
+import argparse
+from datetime import datetime
+import pathlib
 import requests
 import feedparser
-from datetime import datetime
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 import google.generativeai as genai
@@ -18,7 +23,7 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 GEMINI_KEY = (os.getenv("GEMINI_API_KEY") or "").strip()
 NEWSAPI_KEY = (os.getenv("NEWSAPI_KEY") or "").strip()  # opcional
 
-# Fuentes RSS (más cobertura tech)
+# Fuentes RSS (fuerte en tecnología)
 NEWS_SOURCES = {
     "mundial": [
         "https://feeds.bbci.co.uk/news/world/rss.xml",
@@ -39,11 +44,21 @@ NEWS_SOURCES = {
         "https://spectrum.ieee.org/rss/fulltext",
         "https://www.technologyreview.com/feed/",
         "https://www.engadget.com/rss.xml",
+        # Blogs core (alto signal)
+        "https://ai.googleblog.com/feeds/posts/default",
+        "https://openai.com/blog/rss.xml",
+        "https://blogs.nvidia.com/feed/",
     ],
 }
 
-# Cupos por categoría (prioridad tecnología)
-QUOTAS = {"tecnologia": 5, "colombia": 2, "mundial": 2}
+# Cupos por categoría (prioridad tecnología). Puedes ajustar.
+def quotas_for_today():
+    # Fines de semana: un poco menos de tech
+    is_weekend = datetime.utcnow().weekday() >= 5
+    return {"tecnologia": (7 if not is_weekend else 5), "colombia": 2, "mundial": 2}
+
+# Estado persistente para evitar duplicados entre días
+STATE_PATH = pathlib.Path("state_sent.json")
 
 # ================== UTILIDADES ==================
 def escape_markdown(s: str) -> str:
@@ -56,10 +71,45 @@ def escape_markdown(s: str) -> str:
          .replace("`", "\\`")
     )
 
+def chunk(text: str, limit: int = 4096):
+    parts = []
+    t = text
+    while len(t) > limit:
+        cut = t.rfind("\n", 0, limit)
+        if cut == -1:
+            cut = limit
+        parts.append(t[:cut])
+        t = t[cut:]
+    if t:
+        parts.append(t)
+    return parts
+
+def article_uid(a) -> str:
+    base = f"{a.get('title','')}|{a.get('link','')}"
+    return hashlib.sha256(base.encode()).hexdigest()[:16]
+
+def load_state():
+    if STATE_PATH.exists():
+        try:
+            return set(json.loads(STATE_PATH.read_text(encoding="utf-8") or "[]"))
+        except Exception:
+            return set()
+    return set()
+
+def save_state(sent_ids: set):
+    try:
+        STATE_PATH.write_text(json.dumps(list(sent_ids)), encoding="utf-8")
+    except Exception as e:
+        logger.warning(f"No se pudo guardar el estado: {e}")
+
 # ================== BOT ==================
 class NewsBot:
-    def __init__(self):
+    def __init__(self, only_tech: bool = False):
+        self.only_tech = only_tech
         self.processed = set()
+        self.sent_ids = load_state()
+
+        # Inicializa Gemini
         self.model = None
         if GEMINI_KEY:
             try:
@@ -71,7 +121,7 @@ class NewsBot:
             except Exception as e:
                 logger.warning(f"No se pudo inicializar Gemini: {e}")
         else:
-            logger.warning("GEMINI_API_KEY no definido: no habrá traducciones ni resúmenes IA.")
+            logger.warning("GEMINI_API_KEY no definido: no habrá traducción ni resúmenes IA.")
 
     # ------------ Transporte ------------
     def send_message(self, text: str):
@@ -91,6 +141,10 @@ class NewsBot:
                 logger.error(f"Telegram error: {r.text}")
         except Exception as e:
             logger.error(f"Error enviando a Telegram: {e}")
+
+    def send_long(self, text: str):
+        for p in chunk(text):
+            self.send_message(p)
 
     # ------------ IA helpers ------------
     def translate_force_es(self, text: str) -> str:
@@ -112,64 +166,84 @@ class NewsBot:
             logger.error(f"Error traduciendo: {e}")
             return text
 
-    def summarize_extended(self, title: str, description: str, category: str) -> str:
+    def summarize_extended(self, title_es: str, description_es: str, category: str) -> str:
         """Resumen 3–5 frases con contexto. Fallback: descripción limpia."""
+        base = (description_es or title_es or "").strip()
         if not self.model:
-            # Fallback sin IA
-            base = description if description else title
-            return (base or "")[:500]
+            return base[:600]
         try:
             prompt = (
                 "Redacta un resumen informativo en español (3 a 5 frases, "
-                "máximo ~90 palabras) sobre la noticia. Explica qué pasó, "
-                "por qué importa y da contexto breve. No incluyas opiniones.\n\n"
-                f"Título: {title}\n"
-                f"Descripción/Extracto: {description}\n"
+                "máximo ~100 palabras) sobre la noticia. Explica qué pasó, "
+                "por qué importa y da contexto. No incluyas opiniones.\n\n"
+                f"Título: {title_es}\n"
+                f"Descripción/Extracto: {description_es}\n"
                 f"Categoría: {category.upper()}\n"
             )
             resp = self.model.generate_content(prompt)
             out = (getattr(resp, "text", "") or "").strip()
             if not out:
-                return (description or title)[:500]
+                return base[:600]
             return out
         except Exception as e:
             logger.error(f"Error resumiendo: {e}")
-            return (description or title)[:500]
+            return base[:600]
+
+    def summarize_batch(self, articles):
+        """Boletín completo en una sola llamada (secciones, contexto, 'qué vigilar')."""
+        if not self.model or not articles:
+            return None
+        try:
+            lines = []
+            for i, a in enumerate(articles, 1):
+                lines.append(
+                    f"{i}. [{a['cat']}]\n"
+                    f"TÍTULO: {a['title']}\n"
+                    f"DESC: {a['desc'][:900]}\n"
+                    f"LINK: {a['link']}\n---"
+                )
+            block = "\n".join(lines)
+            prompt = (
+                "Redacta un boletín en español, muy claro y profesional, con SECCIONES "
+                "en este orden: TECNOLOGÍA, COLOMBIA, MUNDIAL. Para cada noticia, escribe "
+                "3–5 frases (qué pasó, contexto y por qué importa). Traduce todo al español. "
+                "Cierra con 3 viñetas de 'Qué vigilar'. No agregues disclaimers.\n\n"
+                f"NOTICIAS:\n{block}"
+            )
+            resp = self.model.generate_content(prompt)
+            out = (getattr(resp, "text", "") or "").strip()
+            return out or None
+        except Exception as e:
+            logger.error(f"Error en summarize_batch: {e}")
+            return None
 
     def rank_with_gemini(self, articles):
-        """Pide a Gemini que puntúe importancia (0-10) y devuelve ordenado."""
+        """Puntúa importancia (0-10) priorizando tecnología; fallback heurístico."""
         if not self.model or not articles:
-            return articles
+            # Heurística: tecnología primero
+            return sorted(articles, key=lambda a: (a["cat"] != "tecnologia",))
         try:
             packed = "\n".join(
-                [
-                    f"{i+1}. [{a['cat']}]: {a['title']}\n{(a['desc'] or '')[:280]}"
-                    for i, a in enumerate(articles)
-                ]
+                [f"{i+1}. [{a['cat']}] {a['title']}\n{(a['desc'] or '')[:280]}" for i, a in enumerate(articles)]
             )
             prompt = (
-                "Eres editor senior. Puntúa cada ítem del 1 al 10 según "
-                "impacto, novedad y relevancia para lectores hispanohablantes "
-                "(da preferencia a TECNOLOGÍA si el impacto es similar). "
-                "Responde en JSON: [{idx: <n>, score: <0-10>}].\n\n"
+                "Eres editor senior. Puntúa cada ítem del 1 al 10 según impacto, novedad "
+                "y relevancia para lectores hispanohablantes (da preferencia a TECNOLOGÍA "
+                "si el impacto es similar). Devuelve JSON: [{\"idx\": <n>, \"score\": <0-10>}].\n\n"
                 f"NOTICIAS:\n{packed}"
             )
             resp = self.model.generate_content(prompt)
             txt = (getattr(resp, "text", "") or "").strip()
-            import json
             scores = json.loads(txt)
-            # map idx->score
-            score_map = {int(item["idx"]) - 1: float(item["score"]) for item in scores if "idx" in item and "score" in item}
-            # agrega pequeño boost a tecnología
-            ordered = sorted(
+            score_map = {int(it["idx"]) - 1: float(it["score"]) for it in scores if "idx" in it and "score" in it}
+            ranked = sorted(
                 articles,
                 key=lambda a: score_map.get(a["_i"], 0.0) + (1.0 if a["cat"] == "tecnologia" else 0.0),
                 reverse=True,
             )
-            return ordered
+            return ranked
         except Exception as e:
             logger.warning(f"No se pudo rankear con IA: {e}")
-            # Heurística: tecnología primero, luego resto por orden
             return sorted(articles, key=lambda a: (a["cat"] != "tecnologia",))
 
     # ------------ Datos ------------
@@ -181,16 +255,19 @@ class NewsBot:
                 for entry in feed.entries[:8]:
                     raw_desc = entry.get("description", "") or entry.get("summary", "")
                     desc = BeautifulSoup(raw_desc, "html.parser").get_text(" ").strip()
-                    uid = f"{entry.title}|{entry.link}"
-                    if uid in self.processed:
+                    if not entry.link:
                         continue
-                    arts.append({
-                        "_i": len(self.processed),  # índice interno para ranking IA
+                    a = {
+                        "_i": len(self.processed),
                         "title": entry.title or "",
                         "desc": desc or "",
                         "link": entry.link,
                         "cat": category
-                    })
+                    }
+                    uid = article_uid(a)
+                    if uid in self.processed or uid in self.sent_ids:
+                        continue
+                    arts.append(a)
                     self.processed.add(uid)
             except Exception as e:
                 logger.error(f"Error con RSS {rss}: {e}")
@@ -199,37 +276,42 @@ class NewsBot:
     # ------------ Pipeline ------------
     def collect_all(self):
         all_articles = []
-        for cat in ["tecnologia", "colombia", "mundial"]:  # recolecta tech primero
+        cats = ["tecnologia"] if self.only_tech else ["tecnologia", "colombia", "mundial"]
+        for cat in cats:
             all_articles.extend(self.get_rss(cat))
-        logger.info(f"Recolectadas {len(all_articles)} noticias.")
+        logger.info(f"Recolectadas {len(all_articles)} noticias (only_tech={self.only_tech}).")
         return all_articles
 
     def select_top_by_quota(self, articles):
         """Ordena por importancia y aplica cupos por categoría."""
+        if self.only_tech:
+            # Sin cuotas de COL/MUND si vamos solo tech
+            articles = [a for a in articles if a["cat"] == "tecnologia"]
+            ranked = self.rank_with_gemini(articles)
+            return ranked[:7]
+
         if not articles:
             return []
-        # Ranking global con IA (o heurística)
+        q = quotas_for_today()
         ranked = self.rank_with_gemini(articles)
-        # Filtra por cupos
-        counts = {k: 0 for k in QUOTAS}
+        counts = {k: 0 for k in q}
         selected = []
         for a in ranked:
-            if counts.get(a["cat"], 0) < QUOTAS.get(a["cat"], 0):
+            if counts.get(a["cat"], 0) < q.get(a["cat"], 0):
                 selected.append(a)
                 counts[a["cat"]] += 1
-            # stop si ya llenamos todos los cupos
-            if sum(counts.values()) >= sum(QUOTAS.values()):
+            if sum(counts.values()) >= sum(q.values()):
                 break
-        logger.info(f"Seleccionadas: { {k: v for k, v in counts.items()} }")
-        # Reordena para salida: Tecnología → Colombia → Mundial
+        # Orden final para presentación
         order = {"tecnologia": 0, "colombia": 1, "mundial": 2}
         selected.sort(key=lambda a: order.get(a["cat"], 9))
+        logger.info(f"Seleccionadas por cuota: {counts}")
         return selected
 
-    def create_digest(self, selected):
+    def create_digest_fallback(self, selected):
+        """Fallback por ítem: traduce y resume cada noticia."""
         if not selected:
             return "No hay noticias nuevas."
-
         icons = {"tecnologia": "💻", "colombia": "🇨🇴", "mundial": "🌍"}
         titles = {"tecnologia": "TECNOLOGÍA", "colombia": "COLOMBIA", "mundial": "MUNDIAL"}
 
@@ -240,7 +322,6 @@ class NewsBot:
                 current_cat = a["cat"]
                 text += f"{icons[current_cat]} *{titles[current_cat]}*\n"
 
-            # Traducción forzada de título y descripción
             title_es = self.translate_force_es(a["title"])
             desc_src = a["desc"] if a["desc"] else a["title"]
             resumen = self.summarize_extended(title_es, self.translate_force_es(desc_src), a["cat"])
@@ -253,15 +334,58 @@ class NewsBot:
         text += "---\n🤖 _Resumen automatizado con IA (prioridad tecnología)_"
         return text
 
+    def save_report(self, text: str):
+        reports = pathlib.Path("reports")
+        reports.mkdir(exist_ok=True)
+        fname = reports / f"boletin_{datetime.now().strftime('%Y-%m-%d_%H%M')}.md"
+        try:
+            fname.write_text(text, encoding="utf-8")
+            return str(fname)
+        except Exception as e:
+            logger.warning(f"No se pudo guardar el reporte: {e}")
+            return None
+
     def run(self):
+        start = datetime.now()
         all_articles = self.collect_all()
+        # filtra artículos ya enviados
+        all_articles = [a for a in all_articles if article_uid(a) not in self.sent_ids]
+
         selected = self.select_top_by_quota(all_articles)
-        digest = self.create_digest(selected)
-        self.send_message(digest)
+
+        # Intento 1: resumen batch pro (una sola llamada IA)
+        digest = self.summarize_batch(selected)
+        if digest:
+            digest = escape_markdown(digest)
+        else:
+            # Fallback por ítem
+            digest = self.create_digest_fallback(selected)
+
+        # Enviar (en trozos si es largo)
+        self.send_long(digest)
+
+        # Persistir IDs enviados
+        for a in selected:
+            self.sent_ids.add(article_uid(a))
+        save_state(self.sent_ids)
+
+        # Guardar reporte en repo
+        saved = self.save_report(digest)
+        if saved:
+            logger.info(f"Reporte guardado en: {saved}")
+
+        elapsed = (datetime.now() - start).seconds
+        logger.info(f"Boletín enviado. {len(selected)} noticias. Tiempo total: {elapsed}s.")
 
 # ================== MAIN ==================
+def parse_args():
+    p = argparse.ArgumentParser()
+    p.add_argument("--only-tech", action="store_true", help="Enviar solo tecnología (ignora Colombia y Mundial)")
+    return p.parse_args()
+
 def main():
-    bot = NewsBot()
+    args = parse_args()
+    bot = NewsBot(only_tech=args.only_tech)
     # Prueba visible en logs (debe salir traducido si la key está bien)
     prueba = bot.translate_force_es("Breaking: Apple unveils a new AI feature for iPhone.")
     logger.info(f"Traducción de prueba: {prueba}")
