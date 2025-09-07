@@ -110,6 +110,46 @@ def save_state(sent_ids: set):
     except Exception as e:
         logger.warning(f"No se pudo guardar el estado: {e}")
 
+# ======= Heurística de idioma + refuerzo de español (Gemini) =======
+def is_probably_english(text: str) -> bool:
+    if not text:
+        return False
+    t = text.lower()
+    common = [" the ", " and ", " for ", " with ", " from ", " in ", " on ", " at ",
+              " to ", " of ", " by ", " is ", " are ", " was ", " were ", " as ",
+              " it ", " this ", " that "]
+    t_spaced = f" {t} "
+    hits = sum(1 for w in common if w in t_spaced)
+    return hits >= 2
+
+def ensure_spanish(text: str, model) -> str:
+    """
+    Intenta 2 veces con Gemini: si detectamos inglés, reescribe forzando español.
+    """
+    if not text or not model:
+        return text
+    prompt = (
+        "Traduce al ESPAÑOL neutro, claro y natural. "
+        "No agregues comentarios, notas ni comillas. SOLO el texto final en español.\n\n"
+        f"{text}"
+    )
+    try:
+        r = model.generate_content(prompt)
+        out = (getattr(r, "text", "") or "").strip()
+        if out and not is_probably_english(out):
+            return out
+        # Reintento más estricto
+        prompt2 = (
+            "Reescribe ÍNTEGRAMENTE en ESPAÑOL neutro y natural. "
+            "Prohibido dejar texto en inglés. No agregues comentarios.\n\n"
+            f"{text}"
+        )
+        r2 = model.generate_content(prompt2)
+        out2 = (getattr(r2, "text", "") or "").strip()
+        return out2 or text
+    except Exception:
+        return text
+
 # ================== BOT ==================
 class NewsBot:
     def __init__(self, only_tech: bool = False):
@@ -117,12 +157,20 @@ class NewsBot:
         self.processed = set()
         self.sent_ids = load_state()
 
-        # Inicializa Gemini
+        # Inicializa Gemini (modelo PRO + config estable)
         self.model = None
         if GEMINI_KEY:
             try:
                 genai.configure(api_key=GEMINI_KEY)
-                self.model = genai.GenerativeModel("gemini-1.5-flash")
+                gen_cfg = {
+                    "temperature": 0.2,
+                    "top_p": 0.9,
+                    "top_k": 40,
+                }
+                self.model = genai.GenerativeModel(
+                    model_name="gemini-1.5-pro",
+                    generation_config=gen_cfg
+                )
                 masked = GEMINI_KEY[:4] + "..." + GEMINI_KEY[-4:]
                 logger.info(f"Gemini listo (key {masked}).")
             except Exception as e:
@@ -172,49 +220,36 @@ class NewsBot:
 
     # ------------ IA helpers ------------
     def translate_force_es(self, text: str) -> str:
-        """Fuerza traducción al español con reintento simple."""
+        """Traduce al español con verificación y reintento."""
         if not text:
             return text
         if not self.model:
             logger.warning("Gemini no inicializado: envío sin traducir.")
             return text
-        prompt = (
-            "Traduce al español de forma natural y clara. "
-            "No agregues comentarios ni comillas. Solo el texto traducido.\n\n"
-            f"{text}"
-        )
-        try:
-            resp = self.model.generate_content(prompt)
-            out = (getattr(resp, "text", "") or "").strip()
-            if out:
-                return out
-            # Reintento si vino vacío
-            resp2 = self.model.generate_content(prompt)
-            out2 = (getattr(resp2, "text", "") or "").strip()
-            return out2 or text
-        except Exception as e:
-            logger.error(f"Error traduciendo: {e}")
-            return text
+        out = ensure_spanish(text, self.model)
+        return out or text
 
     def summarize_extended(self, title_es: str, description_es: str, category: str) -> str:
-        """Resumen 3–5 frases con contexto. Fallback: descripción limpia."""
+        """Resumen 3–5 frases en español. Si sale en inglés, se reintenta forzando español."""
         base = (description_es or title_es or "").strip()
         if not self.model:
             return base[:600]
         try:
             prompt = (
-                "Redacta un resumen informativo en español (3 a 5 frases, "
+                "Redacta un resumen informativo en ESPAÑOL (3 a 5 frases, "
                 "máximo ~100 palabras) sobre la noticia. Explica qué pasó, "
                 "por qué importa y da contexto. No incluyas opiniones.\n\n"
-                f"Título: {title_es}\n"
-                f"Descripción/Extracto: {description_es}\n"
+                f"Título (ES): {title_es}\n"
+                f"Descripción/Extracto (ES): {description_es}\n"
                 f"Categoría: {category.upper()}\n"
             )
             resp = self.model.generate_content(prompt)
             out = (getattr(resp, "text", "") or "").strip()
             if not out:
                 return base[:600]
-            return out
+            if is_probably_english(out):
+                out = ensure_spanish(out, self.model)
+            return out or base[:600]
         except Exception as e:
             logger.error(f"Error resumiendo: {e}")
             return base[:600]
