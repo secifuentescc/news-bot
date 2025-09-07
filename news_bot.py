@@ -58,32 +58,20 @@ def quotas_for_today():
 
 STATE_PATH = pathlib.Path("state_sent.json")
 
-# ================== ESCAPES MARKDOWNV2 ==================
-def escape_markdown_v2(text: str) -> str:
+# ================== ESCAPE MARKDOWN (CLÁSICO) ==================
+def escape_markdown(text: str) -> str:
     """
-    Escapa caracteres especiales para MarkdownV2 de Telegram.
-    NO usar alrededor de los *asteriscos* que abren/cierra negrita;
-    úsalo SOLO para el contenido interior.
+    Escape mínimo para Markdown clásico de Telegram.
+    NO toca los asteriscos (*) para que *negrita* funcione.
     """
-    if text is None:
+    if not text:
         return ""
-    specials = r"_*[]()~`>#+-=|{}.!\\"
-    out = []
-    for ch in text:
-        if ch in specials:
-            out.append("\\" + ch)
-        else:
-            out.append(ch)
-    return "".join(out)
-
-def escape_url_md_v2(url: str) -> str:
-    """
-    Para URLs dentro de [texto](url) en MarkdownV2, se deben escapar '(' y ')'
-    y backslashes por seguridad.
-    """
-    if not url:
-        return ""
-    return url.replace("\\", r"\\").replace("(", r"$begin:math:text$").replace(")", r"$end:math:text$")
+    return (
+        text.replace("_", "\\_")
+            .replace("[", "\\[")
+            .replace("]", "\\]")
+            .replace("`", "\\`")
+    )
 
 # ================== UTILIDADES ==================
 def chunk(text: str, limit: int = 4096):
@@ -139,6 +127,7 @@ class NewsBot:
 
     # ------------ Transporte ------------
     def send_message(self, text: str):
+        """Envía un mensaje genérico (Markdown clásico)."""
         if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
             logger.error("Faltan TELEGRAM_BOT_TOKEN o TELEGRAM_CHAT_ID.")
             return
@@ -146,8 +135,8 @@ class NewsBot:
         payload = {
             "chat_id": TELEGRAM_CHAT_ID,
             "text": text,
-            "parse_mode": "MarkdownV2",
-            "disable_web_page_preview": False,
+            "parse_mode": "Markdown",          # <— Volvemos a Markdown clásico
+            "disable_web_page_preview": False, # <— Permite previews
         }
         try:
             r = requests.post(url, data=payload, timeout=25)
@@ -155,6 +144,22 @@ class NewsBot:
                 logger.error(f"Telegram error: {r.text}")
         except Exception as e:
             logger.error(f"Error enviando a Telegram: {e}")
+
+    def send_article(self, title: str, resumen: str, url: str, section_title: str = None, icon: str = ""):
+        """
+        Envía UNA noticia por mensaje, con URL en texto plano para forzar preview con imagen.
+        """
+        lines = []
+        if section_title:
+            lines.append(f"{icon} *{escape_markdown(section_title)}*")
+        lines.append(f"• *{escape_markdown(title)}*")
+        if resumen:
+            lines.append(escape_markdown(resumen))
+        # URL en texto plano → Telegram genera la tarjeta con imagen
+        lines.append(url)
+
+        text = "\n".join(lines)
+        self.send_message(text)
 
     def send_long(self, text: str):
         for p in chunk(text):
@@ -202,34 +207,6 @@ class NewsBot:
         except Exception as e:
             logger.error(f"Error resumiendo: {e}")
             return base[:600]
-
-    def summarize_batch(self, articles):
-        """Boletín completo en una sola llamada (secciones, contexto, 'qué vigilar')."""
-        if not self.model or not articles:
-            return None
-        try:
-            lines = []
-            for i, a in enumerate(articles, 1):
-                lines.append(
-                    f"{i}. [{a['cat']}]\n"
-                    f"TÍTULO: {a['title']}\n"
-                    f"DESC: {a['desc'][:900]}\n"
-                    f"LINK: {a['link']}\n---"
-                )
-            block = "\n".join(lines)
-            prompt = (
-                "Redacta un boletín en español, muy claro y profesional, con SECCIONES "
-                "en este orden: TECNOLOGÍA, COLOMBIA, MUNDIAL. Para cada noticia, escribe "
-                "3–5 frases (qué pasó, contexto y por qué importa). Traduce todo al español. "
-                "Cierra con 3 viñetas de 'Qué vigilar'. No agregues disclaimers.\n\n"
-                f"NOTICIAS:\n{block}"
-            )
-            resp = self.model.generate_content(prompt)
-            out = (getattr(resp, "text", "") or "").strip()
-            return out or None
-        except Exception as e:
-            logger.error(f"Error en summarize_batch: {e}")
-            return None
 
     def rank_with_gemini(self, articles):
         """Puntúa importancia (0-10) priorizando tecnología; fallback heurístico."""
@@ -321,75 +298,40 @@ class NewsBot:
         logger.info(f"Seleccionadas por cuota: {counts}")
         return selected
 
-    def create_digest_fallback(self, selected):
-        """Fallback por ítem: traduce y resume cada noticia (MarkdownV2)."""
-        if not selected:
-            return "*No hay noticias nuevas*"
+    def run(self):
+        start = datetime.now()
         icons = {"tecnologia": "💻", "colombia": "🇨🇴", "mundial": "🌍"}
         titles = {"tecnologia": "TECNOLOGÍA", "colombia": "COLOMBIA", "mundial": "MUNDIAL"}
 
-        header = f"📰 *{escape_markdown_v2('Boletín de noticias')}* — {escape_markdown_v2(datetime.now().strftime('%d/%m/%Y %H:%M'))}\n\n"
-        text = header
+        all_articles = self.collect_all()
+        # filtra artículos ya enviados
+        all_articles = [a for a in all_articles if article_uid(a) not in self.sent_ids]
+        selected = self.select_top_by_quota(all_articles)
+
+        # Cabecera general (un solo mensaje)
+        header = f"📰 *{escape_markdown('Boletín de noticias')}* — {escape_markdown(datetime.now().strftime('%d/%m/%Y %H:%M'))}"
+        self.send_message(header)
+
+        # Envía cada noticia por separado para que Telegram muestre la preview con imagen
         current_cat = None
         for a in selected:
+            section_title = None
+            icon = ""
             if a["cat"] != current_cat:
                 current_cat = a["cat"]
-                text += f"{icons[current_cat]} *{escape_markdown_v2(titles[current_cat])}*\n"
+                section_title = titles[current_cat]
+                icon = icons[current_cat]
 
             title_es = self.translate_force_es(a["title"])
             desc_src = a["desc"] if a["desc"] else a["title"]
             resumen = self.summarize_extended(title_es, self.translate_force_es(desc_src), a["cat"])
 
-            title_bold = f"*{escape_markdown_v2(title_es)}*"
-            resumen_md = escape_markdown_v2(resumen)
-            link_text = escape_markdown_v2("Leer más")
-            link_url = escape_url_md_v2(a["link"])
-
-            text += f"• {title_bold}\n{resumen_md}\n[{link_text}]({link_url})\n\n"
-
-        text += escape_markdown_v2("---") + "\n" + "_Resumen automatizado con IA (prioridad tecnología)_"
-        return text
-
-    def save_report(self, text: str):
-        reports = pathlib.Path("reports")
-        reports.mkdir(exist_ok=True)
-        fname = reports / f"boletin_{datetime.now().strftime('%Y-%m-%d_%H%M')}.md"
-        try:
-            fname.write_text(text, encoding="utf-8")
-            return str(fname)
-        except Exception as e:
-            logger.warning(f"No se pudo guardar el reporte: {e}")
-            return None
-
-    def run(self):
-        start = datetime.now()
-        all_articles = self.collect_all()
-        # filtra artículos ya enviados
-        all_articles = [a for a in all_articles if article_uid(a) not in self.sent_ids]
-
-        selected = self.select_top_by_quota(all_articles)
-
-        # Intento 1: resumen batch pro (una sola llamada IA)
-        digest = self.summarize_batch(selected)
-        if digest:
-            # Escapar TODO el boletín batch antes de enviar
-            digest = escape_markdown_v2(digest)
-        else:
-            # Fallback por ítem
-            digest = self.create_digest_fallback(selected)
-
-        # Enviar (en trozos si es largo)
-        self.send_long(digest)
+            self.send_article(title_es, resumen, a["link"], section_title=section_title, icon=icon)
 
         # Persistir IDs enviados
         for a in selected:
             self.sent_ids.add(article_uid(a))
         save_state(self.sent_ids)
-
-        # Guardar reporte en repo
-        saved = self.save_report(digest)
-        if saved:
-            logger.info(f"Reporte guardado en: {saved}")
 
         elapsed = (datetime.now() - start).seconds
         logger.info(f"Boletín enviado. {len(selected)} noticias. Tiempo total: {elapsed}s.")
