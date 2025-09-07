@@ -1,0 +1,32 @@
+name: NewsBot Schedule
+
+on:
+  schedule:
+    # GitHub Actions usa UTC. Bogotá = UTC-5.
+    # 08:00 y 18:00 en Bogotá → 13:00 y 23:00 UTC
+    - cron: "0 13,23 * * *"
+  workflow_dispatch: {}  # permite correrlo manualmente
+
+jobs:
+  run-newsbot:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run bot
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          python news_bot.py
