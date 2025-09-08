@@ -2,30 +2,48 @@ name: NewsBot Schedule
 
 on:
   schedule:
-    # GitHub Actions usa UTC. Bogotá = UTC-5.
-    # 06:00, 12:00 y 20:00 en Bogotá → 11:00, 17:00 y 01:00 UTC
+    # GitHub Actions usa UTC. Bogotá = UTC-5 (sin DST).
+    # 06:00, 12:00 y 20:00 Bogotá → 11:00, 17:00 y 01:00 UTC
     - cron: "0 11 * * *"   # 06:00 am Bogotá
     - cron: "0 17 * * *"   # 12:00 m Bogotá
-    - cron: "0 1 * * *"    # 08:00 pm Bogotá
-  workflow_dispatch: {}  # permite correrlo manualmente
+    - cron: "0 1 * * *"    # 08:00 pm Bogotá (del día anterior en UTC)
+  workflow_dispatch: {}
 
 jobs:
   run-newsbot:
     runs-on: ubuntu-latest
+    concurrency:
+      group: newsbot # evita solapes si un run tarda y empieza otro
+      cancel-in-progress: false
+
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
 
+      # Cachea el estado de enviados (para no repetir noticias)
       - name: Cache sent state
         uses: actions/cache@v4
         with:
           path: state_sent.json
           key: sent-state
+          restore-keys: |
+            sent-state
 
+      # (Opcional) Cache de pip para acelerar instalaciones
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          cache: "pip"
+
+      # Cachea los modelos de Argos para traducción offline estable
+      - name: Cache Argos models
+        uses: actions/cache@v4
+        with:
+          path: ~/.local/share/argos-translate
+          key: argos-models-v1
+          restore-keys: |
+            argos-models-
 
       - name: Install deps
         run: |
@@ -35,9 +53,9 @@ jobs:
       - name: Run bot
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          NEWSAPI_KEY: ${{ secrets.NEWSAPI_KEY }}
+          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+          GEMINI_API_KEY:     ${{ secrets.GEMINI_API_KEY }}
+          NEWSAPI_KEY:        ${{ secrets.NEWSAPI_KEY }}
         run: |
           python news_bot.py
 
