@@ -11,8 +11,9 @@ import requests
 import feedparser
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 import html
+from collections import defaultdict
 
 # Gemini opcional
 import google.generativeai as genai
@@ -41,10 +42,12 @@ NEWS_SOURCES = {
         "https://spectrum.ieee.org/rss/fulltext",
         "https://www.technologyreview.com/feed/",
         "https://www.engadget.com/rss.xml",
+
         # IA/Cloud
         "https://ai.googleblog.com/feeds/posts/default",
         "https://openai.com/blog/rss.xml",
         "https://blogs.nvidia.com/feed/",
+
         # Apple / iOS
         "https://www.apple.com/newsroom/rss-feed.rss",
         "https://developer.apple.com/news/releases/rss.xml",
@@ -52,15 +55,28 @@ NEWS_SOURCES = {
         "https://www.macrumors.com/macrumors.xml",
         "https://appleinsider.com/rss",
         "https://iosdevweekly.com/issues.rss",
+
         # Android / Dev general
         "https://android-developers.googleblog.com/atom.xml",
         "https://github.blog/changelog/feed/",
         "https://news.ycombinator.com/rss",
         "http://export.arxiv.org/rss/cs.AI",
+
         # Tech en español
         "https://www.xataka.com/tag/feeds/rss2.xml",
         "https://www.hipertextual.com/feed",
         "https://www.genbeta.com/feed",
+
+        # ===== Nuevas: Windows / PC / Hardware / Ciberseguridad =====
+        "https://www.windowscentral.com/rss",
+        "https://www.neowin.net/news/rss/",
+        "https://blogs.windows.com/feed/",
+        "https://www.bleepingcomputer.com/feed/",
+        "https://www.theregister.com/headlines.atom",
+        "https://www.tomshardware.com/feeds/all",
+        "https://www.zdnet.com/news/rss.xml",
+        "https://winbuzzer.com/feed/",
+        "https://www.ghacks.net/feed/",
     ],
     "colombia": [
         "https://www.eltiempo.com/rss.xml",
@@ -98,7 +114,6 @@ def html_escape(text: str) -> str:
     """Escapa texto para parse_mode=HTML de Telegram."""
     if text is None:
         return ""
-    # Escapa &, <, > y comillas
     return html.escape(text, quote=True)
 
 def url_safe(url: str) -> str:
@@ -138,6 +153,15 @@ def save_state(sent_ids: set):
         STATE_PATH.write_text(json.dumps(list(sent_ids)), encoding="utf-8")
     except Exception as e:
         logger.warning(f"No se pudo guardar el estado: {e}")
+
+def domain_of(url: str) -> str:
+    try:
+        host = urlparse(url).netloc.lower()
+        if host.startswith("www."):
+            host = host[4:]
+        return host
+    except Exception:
+        return ""
 
 # ================== EXTRACCIÓN DE IMAGEN ==================
 def get_image_for_entry(entry: dict, fallback_link: str) -> str | None:
@@ -419,11 +443,19 @@ class NewsBot:
         return base_es[:900]
 
     def rank_with_gemini(self, articles):
+        # ===== Boost equilibrado: Apple/Dev/IA + Windows/PC/Seguridad/Hardware =====
         KW_BOOST = {
+            # Apple / Dev
             "apple": 2.2, "ios": 2.2, "iphone": 1.8, "ipad": 1.6, "mac": 1.4, "swift": 2.0, "xcode": 1.9, "wwdc": 2.2,
             "javascript": 2.0, "typescript": 1.8, "node": 1.8, "react": 1.8, "python": 2.0, "django": 1.5, "fastapi": 1.7,
             "docker": 1.6, "kubernetes": 1.6, "github": 1.7, "vscode": 1.6,
             "ai": 1.8, "machine learning": 1.8, "gemini": 1.6, "gpt": 1.6, "openai": 1.8, "llm": 1.8,
+
+            # Windows / Microsoft / PC / Seguridad / Hardware
+            "windows": 2.0, "microsoft": 1.9, "surface": 1.5, "xbox": 1.2, "pc": 1.2,
+            "patch tuesday": 1.8, "cve": 1.6, "vulnerability": 1.6, "ransomware": 1.6, "security": 1.4,
+            "intel": 1.6, "amd": 1.6, "qualcomm": 1.5, "snapdragon": 1.4, "chip": 1.3,
+            "gpu": 1.3, "cpu": 1.3, "motherboard": 1.2, "ssd": 1.1, "ram": 1.1
         }
         def manual_score(a):
             base = 1.0
@@ -510,20 +542,43 @@ class NewsBot:
     def select_top_by_quota(self, articles):
         if not articles:
             return []
+
         ranked = self.rank_with_gemini(articles)
         q = quotas_for_today()
         counts = {k: 0 for k in q}
+
+        # ===== Límite de diversidad por dominio para 'tecnologia' =====
+        PER_DOMAIN_LIMIT_TECH = 2
+        domain_counts_tech = defaultdict(int)
+
         selected = []
         for a in ranked:
-            if counts.get(a["cat"], 0) < q.get(a["cat"], 0):
+            cat = a["cat"]
+            if counts.get(cat, 0) >= q.get(cat, 0):
+                continue
+
+            if cat == "tecnologia":
+                dom = domain_of(a["link"])
+                if dom and domain_counts_tech[dom] >= PER_DOMAIN_LIMIT_TECH:
+                    continue  # ya hay demasiadas del mismo dominio
+                # aceptar y contar dominio
                 selected.append(a)
-                counts[a["cat"]] += 1
+                domain_counts_tech[dom] += 1
+                counts[cat] += 1
+            else:
+                # otras categorías sin límite por dominio
+                selected.append(a)
+                counts[cat] += 1
+
             if sum(counts.values()) >= sum(q.values()):
                 break
+
+        # Asegurar mínimos por categoría (respetando el límite por dominio en tecnología)
         minimums = {"tecnologia": 1, "medicina": 1, "colombia": 1, "mundial": 1}
         by_cat = {"tecnologia": [], "medicina": [], "colombia": [], "mundial": []}
         for a in ranked:
             by_cat[a["cat"]].append(a)
+
         sel_ids = {article_uid(x) for x in selected}
         for cat, min_needed in minimums.items():
             have = sum(1 for x in selected if x["cat"] == cat)
@@ -531,10 +586,21 @@ class NewsBot:
                 continue
             for cand in by_cat.get(cat, []):
                 uid = article_uid(cand)
-                if uid not in sel_ids:
+                if uid in sel_ids:
+                    continue
+                if cat == "tecnologia":
+                    dom = domain_of(cand["link"])
+                    if dom and domain_counts_tech[dom] >= PER_DOMAIN_LIMIT_TECH:
+                        continue
+                    selected.append(cand)
+                    sel_ids.add(uid)
+                    domain_counts_tech[dom] += 1
+                    break
+                else:
                     selected.append(cand)
                     sel_ids.add(uid)
                     break
+
         order = {"tecnologia": 0, "medicina": 1, "colombia": 2, "mundial": 3}
         selected.sort(key=lambda a: order.get(a["cat"], 9))
         logger.info(
