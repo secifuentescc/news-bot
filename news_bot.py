@@ -11,6 +11,7 @@ import requests
 import feedparser
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
+from urllib.parse import quote
 
 # Gemini opcional
 import google.generativeai as genai
@@ -93,21 +94,25 @@ def quotas_for_today():
 
 # ================== MARKDOWNV2 ESCAPES ==================
 def escape_md2(text: str) -> str:
-    """Escapa todos los caracteres especiales de MarkdownV2 sin romper palabras."""
+    """Escapa caracteres especiales de MarkdownV2 (uso general en texto)."""
     if text is None:
         return ""
     text = text.replace("\\", "\\\\")
     return re.sub(r'([_*\[\]\(\)~`>#+\-=|{}.!])', r'\\\1', text)
 
 def escape_md2_url(url: str) -> str:
-    """Escapa lo mínimo necesario en URLs para que no rompan MDV2 y sigan clicables."""
+    """
+    Escapa lo mínimo necesario en URLs pegadas como texto para que sigan clicables
+    y no rompan MarkdownV2. No usamos [texto](url).
+    """
     if not url:
         return ""
+    # Asegurar espacios y caracteres raros percent-encoded sin romper el esquema/dominios
+    # Mantén seguros los típicos separadores de URL:
+    url = quote(url, safe=":/?&=%#@+.,-~")
+    # Escapar solo lo que rompe MDV2 cuando va en texto plano
     url = url.replace("\\", "\\\\")
-    url = url.replace("(", r"$begin:math:text$").replace(")", r"$end:math:text$")
-    url = url.replace("[", r"$begin:math:display$").replace("]", r"$end:math:display$")
-    url = url.replace("_", r"\_")
-    return url
+    return re.sub(r'([()$begin:math:display$$end:math:display$_*\u200b])', r'\\\1', url)
 
 # ================== UTIL ==================
 def chunk_text(text: str, limit: int = 4000):
@@ -222,7 +227,7 @@ def init_argos():
                 logger.info("Argos en→es disponible (instalado).")
                 return lambda txt: tr.translate(txt)
 
-        # si no está, intentamos instalar desde el índice
+        # intentar instalar desde el índice
         try:
             package.update_package_index()
             available = package.get_available_packages()
@@ -253,7 +258,6 @@ def split_for_mymemory(text: str, max_len: int = 450):
     text = text.strip()
     if len(text) <= max_len:
         return [text]
-    # Prioridad: puntos, luego saltos, luego espacios
     sentences = re.split(r'(?<=[\.\!\?])\s+', text)
     chunks, cur = [], ""
     for s in sentences:
@@ -267,7 +271,6 @@ def split_for_mymemory(text: str, max_len: int = 450):
             if len(s) <= max_len:
                 cur = s
             else:
-                # si una parte supera max_len, forzamos troceo por espacios
                 while len(s) > max_len:
                     cut = s.rfind(" ", 0, max_len)
                     if cut == -1:
@@ -299,9 +302,7 @@ def mymemory_translate_en_es(text: str, pause: float = 0.9) -> str:
                         out_parts.append(translated)
                         break
                     else:
-                        # si viene mensaje de error, lo troceamos más
                         if len(part) > 300:
-                            # re-troceo forzado
                             subparts = split_for_mymemory(part, max_len=300)
                             out_parts.append(mymemory_translate_en_es(" ".join(subparts), pause))
                             break
@@ -310,7 +311,7 @@ def mymemory_translate_en_es(text: str, pause: float = 0.9) -> str:
                 time.sleep(pause)
                 continue
         else:
-            out_parts.append(part)  # último recurso: original del trozo
+            out_parts.append(part)
         time.sleep(pause)
     return " ".join(out_parts).strip()
 
