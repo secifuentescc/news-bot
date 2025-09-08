@@ -12,6 +12,7 @@ import feedparser
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 from urllib.parse import quote
+import html
 
 # Gemini opcional
 import google.generativeai as genai
@@ -92,27 +93,19 @@ NEWS_SOURCES = {
 def quotas_for_today():
     return {"tecnologia": 8, "medicina": 4, "colombia": 3, "mundial": 3}
 
-# ================== MARKDOWNV2 ESCAPES ==================
-def escape_md2(text: str) -> str:
-    """Escapa caracteres especiales de MarkdownV2 (uso general en texto)."""
+# ================== ESCAPES (HTML) ==================
+def html_escape(text: str) -> str:
+    """Escapa texto para parse_mode=HTML de Telegram."""
     if text is None:
         return ""
-    text = text.replace("\\", "\\\\")
-    return re.sub(r'([_*\[\]\(\)~`>#+\-=|{}.!])', r'\\\1', text)
+    # Escapa &, <, > y comillas
+    return html.escape(text, quote=True)
 
-def escape_md2_url(url: str) -> str:
-    """
-    Escapa lo mínimo necesario en URLs pegadas como texto para que sigan clicables
-    y no rompan MarkdownV2. No usamos [texto](url).
-    """
+def url_safe(url: str) -> str:
+    """Percent-encode sin romper esquemas/domino/path; sin escapado HTML adicional."""
     if not url:
         return ""
-    # Asegurar espacios y caracteres raros percent-encoded sin romper el esquema/dominios
-    # Mantén seguros los típicos separadores de URL:
-    url = quote(url, safe=":/?&=%#@+.,-~")
-    # Escapar solo lo que rompe MDV2 cuando va en texto plano
-    url = url.replace("\\", "\\\\")
-    return re.sub(r'([()$begin:math:display$$end:math:display$_*\u200b])', r'\\\1', url)
+    return quote(url, safe=":/?&=%#@+.,-~")
 
 # ================== UTIL ==================
 def chunk_text(text: str, limit: int = 4000):
@@ -210,24 +203,19 @@ def fetch_article_snippet(url: str, min_len: int = 300, max_len: int = 900) -> s
 
 # ================== TRADUCCIÓN: ARGOS + GEMINI + MYMEMORY ==================
 def init_argos():
-    """
-    Prepara Argos Translate y se asegura de que el modelo en→es esté instalado.
-    Devuelve (callable o None). No falla el proceso si no hay red.
-    """
+    """Prepara Argos Translate y se asegura de que el modelo en→es esté instalado."""
     try:
         from argostranslate import package, translate as ar_translate
 
-        # ¿ya hay modelo en→es?
         installed = ar_translate.get_installed_languages()
         en = next((l for l in installed if getattr(l, "code", "") == "en"), None)
         es = next((l for l in installed if getattr(l, "code", "") == "es"), None)
         if en and es:
-            tr = en.get_translation(es)  # API correcta
+            tr = en.get_translation(es)
             if tr:
                 logger.info("Argos en→es disponible (instalado).")
                 return lambda txt: tr.translate(txt)
 
-        # intentar instalar desde el índice
         try:
             package.update_package_index()
             available = package.get_available_packages()
@@ -254,7 +242,6 @@ def init_argos():
         return None
 
 def split_for_mymemory(text: str, max_len: int = 450):
-    """Divide por oraciones/espacios para cumplir <500 chars de MyMemory."""
     text = text.strip()
     if len(text) <= max_len:
         return [text]
@@ -283,7 +270,6 @@ def split_for_mymemory(text: str, max_len: int = 450):
     return chunks
 
 def mymemory_translate_en_es(text: str, pause: float = 0.9) -> str:
-    """Traducción robusta con MyMemory en chunks (<500 chars) y joins."""
     if not text:
         return text
     out_parts = []
@@ -339,16 +325,16 @@ class NewsBot:
             except Exception as e:
                 logger.warning(f"No se pudo inicializar Gemini: {e}")
 
-    # ------------ Transporte ------------
-    def send_text(self, text: str):
+    # ------------ Transporte (HTML) ------------
+    def send_text(self, text_html: str):
         if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
             logger.error("Faltan TELEGRAM_BOT_TOKEN o TELEGRAM_CHAT_ID.")
             return
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
         payload = {
             "chat_id": TELEGRAM_CHAT_ID,
-            "text": text,
-            "parse_mode": "MarkdownV2",
+            "text": text_html,
+            "parse_mode": "HTML",
             "disable_web_page_preview": False,
         }
         try:
@@ -358,7 +344,7 @@ class NewsBot:
         except Exception as e:
             logger.error(f"Error enviando a Telegram (texto): {e}")
 
-    def send_photo(self, photo_url: str, caption: str) -> bool:
+    def send_photo(self, photo_url: str, caption_html: str) -> bool:
         if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
             logger.error("Faltan TELEGRAM_BOT_TOKEN o TELEGRAM_CHAT_ID.")
             return False
@@ -366,8 +352,8 @@ class NewsBot:
         payload = {
             "chat_id": TELEGRAM_CHAT_ID,
             "photo": photo_url,
-            "caption": caption[:1024],   # límite caption Telegram
-            "parse_mode": "MarkdownV2",
+            "caption": caption_html[:1024],   # límite caption Telegram
+            "parse_mode": "HTML",
         }
         try:
             r = requests.post(url, data=payload, timeout=25)
@@ -379,13 +365,12 @@ class NewsBot:
             logger.warning(f"Error sendPhoto: {e}")
             return False
 
-    def send_long(self, text: str):
-        for p in chunk_text(text):
+    def send_long(self, text_html: str):
+        for p in chunk_text(text_html):
             self.send_text(p)
 
     # ------------ Traducción / Resumen ------------
     def translate_force_es(self, text: str) -> str:
-        """Orden de preferencia: Argos → Gemini → MyMemory chunked → original."""
         if not text:
             return text
 
@@ -415,7 +400,6 @@ class NewsBot:
         return mymemory_translate_en_es(text)
 
     def summarize_extended(self, title_es: str, base_es: str, category: str) -> str:
-        """Resumen extendido (~120–160 palabras). IA si hay cuota; si no, base_es largo."""
         if self.model:
             try:
                 prompt = (
@@ -435,7 +419,6 @@ class NewsBot:
         return base_es[:900]
 
     def rank_with_gemini(self, articles):
-        # Boost manual por intereses
         KW_BOOST = {
             "apple": 2.2, "ios": 2.2, "iphone": 1.8, "ipad": 1.6, "mac": 1.4, "swift": 2.0, "xcode": 1.9, "wwdc": 2.2,
             "javascript": 2.0, "typescript": 1.8, "node": 1.8, "react": 1.8, "python": 2.0, "django": 1.5, "fastapi": 1.7,
@@ -564,8 +547,8 @@ class NewsBot:
         return selected
 
     def run(self):
-        # Encabezado
-        header = f"📰 *{escape_md2('Boletín de noticias')}* — {escape_md2(datetime.now().strftime('%d/%m/%Y %H:%M'))}"
+        # Encabezado (HTML)
+        header = f"📰 <b>{html_escape('Boletín de noticias')}</b> — {html_escape(datetime.now().strftime('%d/%m/%Y %H:%M'))}"
         self.send_text(header)
 
         all_articles = self.collect_all()
@@ -573,7 +556,7 @@ class NewsBot:
         selected = self.select_top_by_quota(all_articles)
 
         if not selected:
-            self.send_text("_No hay noticias nuevas_")
+            self.send_text("<i>No hay noticias nuevas</i>")
             return
 
         icons  = {"tecnologia": "💻", "colombia": "🇨🇴", "mundial": "🌍", "medicina": "🩺"}
@@ -586,7 +569,7 @@ class NewsBot:
                 continue
 
             # Título de categoría
-            self.send_text(f"{icons.get(cat,'📰')} *{escape_md2(titles[cat])}*")
+            self.send_text(f"{icons.get(cat,'📰')} <b>{html_escape(titles[cat])}</b>")
 
             for a in cat_articles:
                 # 1) Título → ES
@@ -606,11 +589,14 @@ class NewsBot:
                 # 4) Resumen extendido
                 resumen  = self.summarize_extended(title_es, base_es, a["cat"])
 
-                # 5) Caption con control de 1024 y link aparte si hace falta
-                url_esc = escape_md2_url(a['link'])
-                title_esc = escape_md2(title_es)
-                resumen_esc = escape_md2(resumen)
-                caption_full = f"*{title_esc}*\n{resumen_esc}\n{url_esc}"
+                # 5) Caption con control de 1024, SIEMPRE con enlace inline HTML
+                url_raw = a['link']
+                url     = url_safe(url_raw)
+                title_h = html_escape(title_es)
+                resumen_h = html_escape(resumen)
+
+                link_html = f'<a href="{url}">🔗 Leer la nota completa</a>'
+                caption_full = f"<b>{title_h}</b>\n{resumen_h}\n{link_html}"
 
                 def send_with_link(img_url: str | None):
                     if len(caption_full) <= 1024:
@@ -621,19 +607,20 @@ class NewsBot:
                         else:
                             self.send_text(caption_full)
                     else:
+                        # recortar el resumen pero mantener título + enlace dentro del caption
                         max_caption = 1000
-                        resto = max_caption - (len(title_esc) + 3)
+                        base_len = len(f"<b>{title_h}</b>\n") + len("\n") + len(link_html)
+                        resto = max_caption - base_len
                         if resto < 0:
                             resto = 0
-                        resumen_rec = resumen_esc[:resto].rstrip()
-                        caption_short = f"*{title_esc}*\n{resumen_rec}"
+                        resumen_rec = html_escape(resumen[:resto].rstrip())
+                        caption_short = f"<b>{title_h}</b>\n{resumen_rec}\n{link_html}"
                         if img_url:
                             ok = self.send_photo(img_url, caption_short)
                             if not ok:
                                 self.send_text(caption_short)
                         else:
                             self.send_text(caption_short)
-                        self.send_text(url_esc)
 
                 img_url = get_image_for_entry(a.get("_entry", {}), a["link"])
                 send_with_link(img_url)
@@ -642,7 +629,7 @@ class NewsBot:
                 self.sent_ids.add(article_uid(a))
 
         # Footer
-        self.send_text(escape_md2("---") + "\n" + "_Resumen automatizado con IA (prioridad tecnología)_")
+        self.send_text(html_escape("---") + "\n" + "<i>Resumen automatizado con IA (prioridad tecnología)</i>")
 
         # Persistir estado
         save_state(self.sent_ids)
@@ -652,7 +639,7 @@ class NewsBot:
         reports.mkdir(exist_ok=True)
         fname = reports / f"boletin_{datetime.now().strftime('%Y-%m-%d_%H%M')}.md"
         try:
-            fname.write_text(f"{header}\n\nReporte enviado por Telegram.\n", encoding="utf-8")
+            fname.write_text(f"{html.unescape(header)}\n\nReporte enviado por Telegram.\n", encoding="utf-8")
             logger.info(f"Reporte guardado en: {fname}")
         except Exception as e:
             logger.warning(f"No se pudo guardar el reporte: {e}")
